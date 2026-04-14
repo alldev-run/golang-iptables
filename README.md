@@ -182,13 +182,6 @@ ws.onopen = () => {
 fetch('http://localhost:8080/api/test')
   .then(response => response.json())
   .then(data => console.log(data));
-
-// 带认证头的请求
-fetch('http://localhost:8080/api/test', {
-  headers: {
-    'Authorization': 'Bearer your-token'
-  }
-});
 ```
 
 **后端路由说明：**
