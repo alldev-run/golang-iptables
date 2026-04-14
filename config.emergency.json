@@ -6,10 +6,10 @@
     "password": ""
   },
   "rateLimit": {
-    "maxRequests": 60,
-    "globalMaxRequests": 2500,
+    "maxRequests": 20,
+    "globalMaxRequests": 800,
     "windowSec": 10,
-    "maxConn": 2
+    "maxConn": 1
   },
   "auth": {
     "token": "CHANGE_ME_STRONG_TOKEN"
@@ -19,10 +19,10 @@
     "::1/128"
   ],
   "limits": {
-    "maxConnections": 2000,
+    "maxConnections": 800,
     "maxBodySizeMB": 2,
     "webSocketBufferSize": 262144,
-    "webSocketMaxLifetimeSec": 1800,
+    "webSocketMaxLifetimeSec": 600,
     "ipsetConcurrency": 20,
     "ipsetTimeoutSec": 3,
     "machineHealthCheckSec": 2,

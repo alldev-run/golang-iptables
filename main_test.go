@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,42 +93,6 @@ func TestGetClientIP_TrustedProxy(t *testing.T) {
 	}
 }
 
-// 测试负载均衡轮询
-func TestPickBackend(t *testing.T) {
-	backendsMu.Lock()
-	backends = []string{"backend1", "backend2", "backend3"}
-	backendsMu.Unlock()
-
-	healthMu.Lock()
-	backendHealth = map[string]bool{
-		"backend1": true,
-		"backend2": true,
-		"backend3": true,
-	}
-	healthMu.Unlock()
-
-	// 重置计数器
-	backendIndex = 0
-
-	results := make(map[string]int)
-	for i := 0; i < 30; i++ {
-		backend := pickBackend("", false)
-		results[backend]++
-	}
-
-	// 验证每个后端都被选中
-	if len(results) != 3 {
-		t.Errorf("期望选中 3 个后端，实际选中 %d 个", len(results))
-	}
-
-	// 验证分布相对均匀（允许一定误差）
-	for _, count := range results {
-		if count < 8 || count > 12 {
-			t.Errorf("后端分布不均匀: %v", results)
-		}
-	}
-}
-
 // 测试配置文件加载
 func TestLoadConfig(t *testing.T) {
 	// 保存原始配置文件路径
@@ -140,7 +106,7 @@ func TestLoadConfig(t *testing.T) {
 	// 测试正常配置
 	t.Run("正常配置", func(t *testing.T) {
 		testConfig := `{
-			"backends": ["127.0.0.1:9502", "127.0.0.1:9503"],
+			"backend": "127.0.0.1:9502",
 			"redis": {
 				"addr": "127.0.0.1:16379",
 				"db": 14,
@@ -156,17 +122,15 @@ func TestLoadConfig(t *testing.T) {
 			t.Errorf("loadConfig() error = %v", err)
 		}
 
-		backendsMu.RLock()
-		defer backendsMu.RUnlock()
-		if len(backends) != 2 {
-			t.Errorf("期望 2 个后端，实际 %d 个", len(backends))
+		if cfg.Backend != "127.0.0.1:9502" {
+			t.Errorf("期望 backend 为 127.0.0.1:9502，实际 %s", cfg.Backend)
 		}
 	})
 
-	// 测试空 backends
-	t.Run("空 backends", func(t *testing.T) {
+	// 测试空 backend（会使用默认值）
+	t.Run("空 backend", func(t *testing.T) {
 		testConfig := `{
-			"backends": [],
+			"backend": "",
 			"redis": {
 				"addr": "127.0.0.1:16379",
 				"db": 14,
@@ -178,8 +142,12 @@ func TestLoadConfig(t *testing.T) {
 			t.Fatalf("写入测试配置失败: %v", err)
 		}
 
-		if err := loadConfig(); err == nil {
-			t.Error("期望返回错误，但返回 nil")
+		if err := loadConfig(); err != nil {
+			t.Errorf("loadConfig() error = %v", err)
+		}
+
+		if cfg.Backend != "127.0.0.1:9502" {
+			t.Errorf("期望使用默认 backend 127.0.0.1:9502，实际 %s", cfg.Backend)
 		}
 	})
 
@@ -194,7 +162,7 @@ func TestLoadConfig(t *testing.T) {
 	// 测试 trustedProxies 非法配置
 	t.Run("trustedProxies 非法配置", func(t *testing.T) {
 		testConfig := `{
-			"backends": ["127.0.0.1:9502"],
+			"backend": "127.0.0.1:9502",
 			"redis": {
 				"addr": "127.0.0.1:16379",
 				"db": 14,
@@ -510,6 +478,78 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 	}
 }
 
+func TestSyncIPSetBan_StaleTaskDoesNotOverrideLatest(t *testing.T) {
+	originalCfg := cfg
+	originalSem := ipsetSem
+	originalCache := ipsetCache
+	defer func() {
+		cfg = originalCfg
+		ipsetSem = originalSem
+		ipsetCache = originalCache
+	}()
+
+	cfg = defaultConfig()
+	cfg.Limits.IpsetTimeoutSec = 1
+	ipsetCache = make(map[string]time.Time)
+
+	tmpDir := t.TempDir()
+	logFile := tmpDir + "/ipset_calls.log"
+	scriptPath := tmpDir + "/ipset"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> \"" + logFile + "\"\n"
+	if err := os.WriteFile(logFile, []byte{}, 0o644); err != nil {
+		t.Fatalf("创建 fake ipset 日志文件失败: %v", err)
+	}
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("创建 fake ipset 失败: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
+	if err := exec.Command("ipset", "probe").Run(); err != nil {
+		t.Fatalf("fake ipset 不可执行: %v", err)
+	}
+	if err := os.WriteFile(logFile, []byte{}, 0o644); err != nil {
+		t.Fatalf("重置 fake ipset 日志文件失败: %v", err)
+	}
+
+	ipsetSem = make(chan struct{}, 1)
+	ipsetSem <- struct{}{}
+
+	ip := "1.2.3.4"
+	syncIPSetBan(ip, 2*time.Second)
+	time.Sleep(50 * time.Millisecond)
+	syncIPSetBan(ip, 5*time.Second)
+	time.Sleep(50 * time.Millisecond)
+
+	<-ipsetSem
+
+	var content []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var err error
+		content, err = os.ReadFile(logFile)
+		if err != nil {
+			t.Fatalf("读取 fake ipset 调用日志失败: %v", err)
+		}
+		if strings.TrimSpace(string(content)) != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待 ipset 调用超时")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	trimmed := strings.TrimSpace(string(content))
+	if trimmed == "" {
+		t.Fatalf("预期至少有一次 ipset 调用")
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("过期任务不应执行 ipset，预期 1 次调用，实际 %d 次，内容=%q", len(lines), trimmed)
+	}
+}
+
 func TestIsDialFailure(t *testing.T) {
 	tests := []struct {
 		name string
@@ -560,6 +600,56 @@ func TestIsDialFailure(t *testing.T) {
 	}
 }
 
+func TestMachineCircuitStateTransitions(t *testing.T) {
+	originalCfg := cfg
+	originalHasPrevCPU := machineHasPrevCPU
+	originalUnhealthy := machineUnhealthyStreak
+	originalHealthy := machineHealthyStreak
+	originalOpen := machineCircuitOpen.Load()
+	originalReason, _ := machineCircuitReason.Load().(string)
+	defer func() {
+		cfg = originalCfg
+		machineHasPrevCPU = originalHasPrevCPU
+		machineUnhealthyStreak = originalUnhealthy
+		machineHealthyStreak = originalHealthy
+		machineCircuitOpen.Store(originalOpen)
+		machineCircuitReason.Store(originalReason)
+	}()
+
+	cfg = defaultConfig()
+	cfg.Limits.MachineUnhealthyThreshold = 2
+	cfg.Limits.MachineRecoveryThreshold = 2
+	machineHasPrevCPU = false
+	machineUnhealthyStreak = 0
+	machineHealthyStreak = 0
+	machineCircuitOpen.Store(false)
+	machineCircuitReason.Store("")
+
+	updateMachineCircuitState(false, "cpu=99.0%")
+	if open, _ := machineCircuitStatus(); open {
+		t.Fatalf("第一次异常不应触发熔断")
+	}
+
+	updateMachineCircuitState(false, "cpu=99.0%")
+	open, reason := machineCircuitStatus()
+	if !open {
+		t.Fatalf("达到异常阈值后应触发熔断")
+	}
+	if reason == "" {
+		t.Fatalf("熔断触发后应记录原因")
+	}
+
+	updateMachineCircuitState(true, "")
+	if open, _ := machineCircuitStatus(); !open {
+		t.Fatalf("恢复次数不足时不应立即关闭熔断")
+	}
+
+	updateMachineCircuitState(true, "")
+	if open, _ := machineCircuitStatus(); open {
+		t.Fatalf("达到恢复阈值后应关闭熔断")
+	}
+}
+
 // 测试心跳机制
 func TestHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -582,26 +672,6 @@ func TestHeartbeat(t *testing.T) {
 		// context 正确取消
 	case <-time.After(200 * time.Millisecond):
 		t.Error("context 未在预期时间内取消")
-	}
-}
-
-// 基准测试：pickBackend
-func BenchmarkPickBackend(b *testing.B) {
-	backendsMu.Lock()
-	backends = []string{"backend1", "backend2", "backend3"}
-	backendsMu.Unlock()
-
-	healthMu.Lock()
-	backendHealth = map[string]bool{
-		"backend1": true,
-		"backend2": true,
-		"backend3": true,
-	}
-	healthMu.Unlock()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pickBackend("", false)
 	}
 }
 

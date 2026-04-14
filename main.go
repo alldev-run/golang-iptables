@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,9 +24,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -36,16 +36,7 @@ var (
 	// Redis
 	rdb *redis.Client
 
-	// 后端列表（线程安全）
-	backends   []string
-	backendsMu sync.RWMutex
-
-	// 后端健康状态
-	backendHealth map[string]bool
-	healthMu      sync.RWMutex
-
-	// 轮询计数器
-	backendIndex uint64
+	// 限流序列号
 	rateLimitSeq uint64
 
 	// ipset 去重锁
@@ -70,6 +61,51 @@ end
 return 0
 `)
 
+	rateLimitGlobalAndIPScript = redis.NewScript(`
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local globalLimit = tonumber(ARGV[3])
+local ipLimit = tonumber(ARGV[4])
+
+redis.call("ZADD", KEYS[1], now, ARGV[5])
+redis.call("ZREMRANGEBYSCORE", KEYS[1], "0", tostring(now - window))
+local globalCount = redis.call("ZCARD", KEYS[1])
+redis.call("PEXPIRE", KEYS[1], window)
+if globalCount > globalLimit then
+	return 0
+end
+
+redis.call("ZADD", KEYS[2], now, ARGV[6])
+redis.call("ZREMRANGEBYSCORE", KEYS[2], "0", tostring(now - window))
+local ipCount = redis.call("ZCARD", KEYS[2])
+redis.call("PEXPIRE", KEYS[2], window)
+if ipCount > ipLimit then
+	return 1
+end
+
+return 2
+`)
+
+	connWindowLimitScript = redis.NewScript(`
+local val = redis.call("INCR", KEYS[1])
+redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+if val <= tonumber(ARGV[2]) then
+	return 1
+end
+return 0
+`)
+
+	proxyTransport = &http.Transport{
+		Proxy:                  http.ProxyFromEnvironment,
+		DialContext:            (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:           100,
+		IdleConnTimeout:        90 * time.Second,
+		TLSHandshakeTimeout:    5 * time.Second,
+		ExpectContinueTimeout:  1 * time.Second,
+		ResponseHeaderTimeout:  5 * time.Second,
+		MaxResponseHeaderBytes: 1 << 20,
+	}
+
 	// ipset 并发限制（防止 ipset 慢或卡住时拖垮服务）
 	ipsetSem chan struct{}
 
@@ -82,69 +118,22 @@ return 0
 	// 全局配置
 	cfg Config
 
+	httpReverseProxy atomic.Value
+
 	trustedProxyMu   sync.RWMutex
 	trustedProxyNets []*net.IPNet
 
-	// Prometheus metrics
-	totalConnections = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gateway_total_connections",
-			Help: "Total number of connections",
-		},
-		[]string{"type"}, // http or websocket
-	)
-
-	activeConnections = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "gateway_active_connections",
-			Help: "Number of active connections",
-		},
-		[]string{"type"},
-	)
-
-	totalRequests = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gateway_total_requests",
-			Help: "Total number of requests",
-		},
-		[]string{"method", "path"},
-	)
-
-	requestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "gateway_request_duration_seconds",
-			Help:    "Request duration in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"type"},
-	)
-
-	backendHealthMetric = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "gateway_backend_health",
-			Help: "Backend health status (1=healthy, 0=unhealthy)",
-		},
-		[]string{"backend"},
-	)
-
-	rateLimitRejections = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gateway_rate_limit_rejections",
-			Help: "Number of requests rejected due to rate limiting",
-		},
-		[]string{"reason"},
-	)
-
-	blacklistHits = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "gateway_blacklist_hits",
-			Help: "Number of requests from blacklisted IPs",
-		},
-	)
+	machineHealthMu        sync.Mutex
+	machinePrevCPUSnapshot cpuSnapshot
+	machineHasPrevCPU      bool
+	machineUnhealthyStreak int
+	machineHealthyStreak   int
+	machineCircuitOpen     atomic.Bool
+	machineCircuitReason   atomic.Value
 )
 
 type Config struct {
-	Backends       []string        `json:"backends"`
+	Backend        string          `json:"backend"`
 	Redis          RedisConfig     `json:"redis"`
 	RateLimit      RateLimitConfig `json:"rateLimit"`
 	Auth           AuthConfig      `json:"auth"`
@@ -176,15 +165,24 @@ type LimitConfig struct {
 	WebSocketMaxLifetimeSec int `json:"webSocketMaxLifetimeSec"` // WebSocket 最大连接生命周期 (秒)
 	IpsetConcurrency    int `json:"ipsetConcurrency"`    // ipset 并发数
 	IpsetTimeoutSec     int `json:"ipsetTimeoutSec"`     // ipset 命令超时 (秒)
+	MachineHealthCheckSec   int     `json:"machineHealthCheckSec"`   // 机器健康检查间隔 (秒)
+	MachineMaxCPUPercent    float64 `json:"machineMaxCPUPercent"`    // CPU 使用率阈值 (%)
+	MachineMaxLoadPerCPU    float64 `json:"machineMaxLoadPerCpu"`    // 每核 Load 阈值
+	MachineMaxMemoryPercent float64 `json:"machineMaxMemoryPercent"` // 内存使用率阈值 (%)
+	MachineUnhealthyThreshold int   `json:"machineUnhealthyThreshold"` // 连续异常次数触发熔断
+	MachineRecoveryThreshold  int   `json:"machineRecoveryThreshold"`  // 连续恢复次数关闭熔断
 	AuthTimeoutSec      int `json:"authTimeoutSec"`      // 认证超时 (秒)
-	HealthCheckInterval int `json:"healthCheckInterval"` // 健康检查间隔 (秒)
-	HealthCheckTimeout  int `json:"healthCheckTimeout"`  // 健康检查超时 (秒)
 	ShutdownTimeoutSec  int `json:"shutdownTimeoutSec"`  // 优雅关闭超时 (秒)
+}
+
+type cpuSnapshot struct {
+	total uint64
+	idle  uint64
 }
 
 func defaultConfig() Config {
 	return Config{
-		Backends: []string{"127.0.0.1:9502"},
+		Backend: "127.0.0.1:9502",
 		Redis: RedisConfig{
 			Addr:     "127.0.0.1:6379",
 			DB:       14,
@@ -207,29 +205,23 @@ func defaultConfig() Config {
 			WebSocketMaxLifetimeSec: 7200,
 			IpsetConcurrency:    10,
 			IpsetTimeoutSec:     5,
+			MachineHealthCheckSec:   2,
+			MachineMaxCPUPercent:    92,
+			MachineMaxLoadPerCPU:    1.5,
+			MachineMaxMemoryPercent: 95,
+			MachineUnhealthyThreshold: 3,
+			MachineRecoveryThreshold:  3,
 			AuthTimeoutSec:      3,
-			HealthCheckInterval: 30,
-			HealthCheckTimeout:  3,
 			ShutdownTimeoutSec:  30,
 		},
 	}
 }
 
 func normalizeConfig(c *Config) {
-	filteredBackends := make([]string, 0, len(c.Backends))
-	seen := make(map[string]struct{}, len(c.Backends))
-	for _, backend := range c.Backends {
-		backend = strings.TrimSpace(backend)
-		if backend == "" {
-			continue
-		}
-		if _, exists := seen[backend]; exists {
-			continue
-		}
-		seen[backend] = struct{}{}
-		filteredBackends = append(filteredBackends, backend)
+	c.Backend = strings.TrimSpace(c.Backend)
+	if c.Backend == "" {
+		c.Backend = "127.0.0.1:9502"
 	}
-	c.Backends = filteredBackends
 
 	filteredTrustedProxies := make([]string, 0, len(c.TrustedProxies))
 	seenTrustedProxies := make(map[string]struct{}, len(c.TrustedProxies))
@@ -280,14 +272,26 @@ func normalizeConfig(c *Config) {
 	if c.Limits.IpsetTimeoutSec <= 0 {
 		c.Limits.IpsetTimeoutSec = 5
 	}
+	if c.Limits.MachineHealthCheckSec <= 0 {
+		c.Limits.MachineHealthCheckSec = 2
+	}
+	if c.Limits.MachineMaxCPUPercent <= 0 {
+		c.Limits.MachineMaxCPUPercent = 92
+	}
+	if c.Limits.MachineMaxLoadPerCPU <= 0 {
+		c.Limits.MachineMaxLoadPerCPU = 1.5
+	}
+	if c.Limits.MachineMaxMemoryPercent <= 0 {
+		c.Limits.MachineMaxMemoryPercent = 95
+	}
+	if c.Limits.MachineUnhealthyThreshold <= 0 {
+		c.Limits.MachineUnhealthyThreshold = 3
+	}
+	if c.Limits.MachineRecoveryThreshold <= 0 {
+		c.Limits.MachineRecoveryThreshold = 3
+	}
 	if c.Limits.AuthTimeoutSec <= 0 {
 		c.Limits.AuthTimeoutSec = 3
-	}
-	if c.Limits.HealthCheckInterval <= 0 {
-		c.Limits.HealthCheckInterval = 30
-	}
-	if c.Limits.HealthCheckTimeout <= 0 {
-		c.Limits.HealthCheckTimeout = 3
 	}
 	if c.Limits.ShutdownTimeoutSec <= 0 {
 		c.Limits.ShutdownTimeoutSec = 30
@@ -352,8 +356,8 @@ func isTrustedProxyIP(ip net.IP) bool {
 
 func applyConfig(newCfg Config) error {
 	normalizeConfig(&newCfg)
-	if len(newCfg.Backends) == 0 {
-		return fmt.Errorf("配置文件中 backends 不能为空")
+	if newCfg.Backend == "" {
+		return fmt.Errorf("配置文件中 backend 不能为空")
 	}
 
 	parsedTrustedProxyNets, err := buildTrustedProxyNets(newCfg.TrustedProxies)
@@ -366,34 +370,17 @@ func applyConfig(newCfg Config) error {
 	trustedProxyNets = parsedTrustedProxyNets
 	trustedProxyMu.Unlock()
 
-	backendsMu.Lock()
-	backends = append(backends[:0], cfg.Backends...)
-	backendsMu.Unlock()
-
-	healthMu.Lock()
-	if backendHealth == nil {
-		backendHealth = make(map[string]bool)
+	targetURL, err := url.Parse("http://" + cfg.Backend)
+	if err != nil {
+		return fmt.Errorf("backend 配置无效: %w", err)
 	}
-
-	active := make(map[string]struct{}, len(backends))
-	for _, backend := range backends {
-		active[backend] = struct{}{}
-		if _, exists := backendHealth[backend]; !exists {
-			backendHealth[backend] = true
-		}
-		if backendHealth[backend] {
-			backendHealthMetric.WithLabelValues(backend).Set(1)
-		} else {
-			backendHealthMetric.WithLabelValues(backend).Set(0)
-		}
+	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
+	reverseProxy.Transport = proxyTransport
+	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Println("代理错误:", err)
+		http.Error(w, "Bad Gateway", 502)
 	}
-	for backend := range backendHealth {
-		if _, exists := active[backend]; !exists {
-			delete(backendHealth, backend)
-			backendHealthMetric.DeleteLabelValues(backend)
-		}
-	}
-	healthMu.Unlock()
+	httpReverseProxy.Store(reverseProxy)
 
 	upgrader.ReadBufferSize = cfg.Limits.WebSocketBufferSize
 	upgrader.WriteBufferSize = cfg.Limits.WebSocketBufferSize
@@ -402,17 +389,6 @@ func applyConfig(newCfg Config) error {
 	connSem = make(chan struct{}, cfg.Limits.MaxConnections)
 
 	return nil
-}
-
-func init() {
-	// 注册 Prometheus metrics
-	prometheus.MustRegister(totalConnections)
-	prometheus.MustRegister(activeConnections)
-	prometheus.MustRegister(totalRequests)
-	prometheus.MustRegister(requestDuration)
-	prometheus.MustRegister(backendHealthMetric)
-	prometheus.MustRegister(rateLimitRejections)
-	prometheus.MustRegister(blacklistHits)
 }
 
 // ---------------- Redis初始化 ----------------
@@ -440,7 +416,7 @@ func loadConfig() error {
 		return err
 	}
 
-	log.Println("配置已加载, 后端列表:", backends)
+	log.Println("配置已加载, 后端:", cfg.Backend)
 	return nil
 }
 
@@ -531,9 +507,6 @@ func isBlacklisted(ctx context.Context, ip string) bool {
 		log.Println("Redis error in isBlacklisted:", err)
 		return false
 	}
-	if val == 1 {
-		blacklistHits.Inc()
-	}
 	return val == 1
 }
 
@@ -577,14 +550,15 @@ func setBlacklistWithMaxTTL(ctx context.Context, key string, levelKey string, du
 
 func syncIPSetBan(ip string, banDuration time.Duration) {
 	expireAt := time.Now().Add(banDuration)
+	ipLocal := ip
 
 	ipsetMutex.Lock()
-	currentExpireAt, ok := ipsetCache[ip]
+	currentExpireAt, ok := ipsetCache[ipLocal]
 	if ok && !expireAt.After(currentExpireAt) {
 		ipsetMutex.Unlock()
 		return
 	}
-	ipsetCache[ip] = expireAt
+	ipsetCache[ipLocal] = expireAt
 	ipsetMutex.Unlock()
 
 	go func(expectedExpireAt time.Time) {
@@ -593,9 +567,9 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 			time.Sleep(sleepFor)
 		}
 		ipsetMutex.Lock()
-		current, exists := ipsetCache[ip]
+		current, exists := ipsetCache[ipLocal]
 		if exists && !current.After(expectedExpireAt) {
-			delete(ipsetCache, ip)
+			delete(ipsetCache, ipLocal)
 		}
 		ipsetMutex.Unlock()
 	}(expireAt)
@@ -608,7 +582,7 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 		}
 
 		ipsetMutex.Lock()
-		current, exists := ipsetCache[ip]
+		current, exists := ipsetCache[ipLocal]
 		if !exists || current.After(expectedExpireAt) {
 			ipsetMutex.Unlock()
 			return
@@ -618,6 +592,14 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 		sem <- struct{}{}
 		defer func() { <-sem }()
 
+		ipsetMutex.Lock()
+		current, exists = ipsetCache[ipLocal]
+		if !exists || current.After(expectedExpireAt) {
+			ipsetMutex.Unlock()
+			return
+		}
+		ipsetMutex.Unlock()
+
 		cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
 		defer cmdCancel()
 
@@ -626,9 +608,9 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 			return
 		}
 
-		cmd := exec.CommandContext(cmdCtx, "ipset", "add", "blacklist", ip, "timeout", fmt.Sprintf("%d", banSeconds))
-		if err := cmd.Run(); err != nil {
-			log.Println("ipset error:", err)
+		cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ipLocal, "timeout", fmt.Sprintf("%d", banSeconds))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("ipset error: %v, output=%s", err, strings.TrimSpace(string(output)))
 		}
 	}(expireAt)
 }
@@ -669,74 +651,65 @@ func banIP(ctx context.Context, ip string) {
 func incConn(ctx context.Context, ip string) (bool, error) {
 	// 使用时间窗口前缀防止单 key 热点
 	timeWindow := time.Now().Unix() / 60 // 每分钟一个窗口
-	key := fmt.Sprintf("conn:%s:%d", ip, timeWindow)
-	val, err := rdb.Incr(ctx, key).Result()
+	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
+	allowed, err := connWindowLimitScript.Run(ctx, rdb, []string{key}, 60, cfg.RateLimit.MaxConn).Int64()
 	if err != nil {
 		return false, err
 	}
-	if err := rdb.Expire(ctx, key, 60*time.Second).Err(); err != nil {
-		return false, err
-	}
-	return val <= int64(cfg.RateLimit.MaxConn), nil
+	return allowed == 1, nil
 }
 
 func decConn(ctx context.Context, ip string) {
 	timeWindow := time.Now().Unix() / 60
-	if err := rdb.Decr(ctx, fmt.Sprintf("conn:%s:%d", ip, timeWindow)).Err(); err != nil {
+	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
+	if err := rdb.Decr(ctx, key).Err(); err != nil {
 		log.Println("Redis error in decConn:", err)
 	}
-}
-
-func allowSlidingWindow(ctx context.Context, key string, limit int, windowSec int, member string, now int64) (bool, error) {
-	if limit <= 0 {
-		return false, nil
-	}
-
-	windowMillis := int64(windowSec) * 1000
-	if windowMillis <= 0 {
-		windowMillis = 10000
-	}
-
-	start := now - windowMillis
-
-	pipe := rdb.TxPipeline()
-	pipe.ZAdd(ctx, key, redis.Z{Score: float64(now), Member: member})
-	pipe.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", start))
-	count := pipe.ZCard(ctx, key)
-	pipe.Expire(ctx, key, time.Duration(windowSec)*time.Second)
-
-	if _, err := pipe.Exec(ctx); err != nil {
-		return false, err
-	}
-
-	return count.Val() <= int64(limit), nil
 }
 
 // ---------------- 滑动窗口限流 ----------------
 func allowRequestWithReason(ctx context.Context, ip string) (bool, string) {
 	now := time.Now().UnixMilli()
-	member := fmt.Sprintf("%d-%d", now, atomic.AddUint64(&rateLimitSeq, 1))
+	member := strconv.FormatInt(now, 10) + "-" + strconv.FormatUint(atomic.AddUint64(&rateLimitSeq, 1), 10)
 	windowSec := cfg.RateLimit.WindowSec
-
-	globalAllowed, err := allowSlidingWindow(ctx, "rate:global", cfg.RateLimit.GlobalMaxRequests, windowSec, member+"-g", now)
-	if err != nil {
-		log.Println("Redis error in allowRequest (global):", err)
-		return false, "redis"
+	windowMillis := int64(windowSec) * 1000
+	if windowMillis <= 0 {
+		windowMillis = 10000
 	}
-	if !globalAllowed {
+	if cfg.RateLimit.GlobalMaxRequests <= 0 {
 		return false, "global"
 	}
-
-	ipAllowed, err := allowSlidingWindow(ctx, "rate:ip:"+ip, cfg.RateLimit.MaxRequests, windowSec, member+"-i", now)
-	if err != nil {
-		log.Println("Redis error in allowRequest (ip):", err)
-		return false, "redis"
-	}
-	if !ipAllowed {
+	if cfg.RateLimit.MaxRequests <= 0 {
 		return false, "ip"
 	}
 
-	return true, ""
+	result, err := rateLimitGlobalAndIPScript.Run(
+		ctx,
+		rdb,
+		[]string{"rate:global", "rate:ip:" + ip},
+		now,
+		windowMillis,
+		cfg.RateLimit.GlobalMaxRequests,
+		cfg.RateLimit.MaxRequests,
+		member+"-g",
+		member+"-i",
+	).Int64()
+	if err != nil {
+		log.Println("Redis error in allowRequest:", err)
+		return false, "redis"
+	}
+
+	switch result {
+	case 2:
+		return true, ""
+	case 1:
+		return false, "ip"
+	case 0:
+		return false, "global"
+	default:
+		log.Printf("Unexpected rate limit result: %d", result)
+		return false, "redis"
+	}
 }
 
 func allowRequest(ctx context.Context, ip string) bool {
@@ -757,13 +730,13 @@ func auth(r *http.Request) bool {
 }
 
 // ---------------- 心跳 ----------------
-func heartbeat(ws *websocket.Conn, wsWriteMu *sync.Mutex, ctx context.Context, cancel context.CancelFunc) {
+func heartbeat(ws *wsWriteConn, ctx context.Context, cancel context.CancelFunc) {
 	const wsReadTimeout = 65 * time.Second
-	ws.SetPongHandler(func(string) error {
-		ws.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	ws.conn.SetPongHandler(func(string) error {
+		ws.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		return nil
 	})
-	_ = ws.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	_ = ws.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -772,9 +745,7 @@ func heartbeat(ws *websocket.Conn, wsWriteMu *sync.Mutex, ctx context.Context, c
 		for {
 			select {
 			case <-ticker.C:
-				wsWriteMu.Lock()
 				err := ws.WriteMessage(websocket.PingMessage, nil)
-				wsWriteMu.Unlock()
 				if err != nil {
 					cancel()
 					return
@@ -786,53 +757,21 @@ func heartbeat(ws *websocket.Conn, wsWriteMu *sync.Mutex, ctx context.Context, c
 	}()
 }
 
-// ---------------- 后端健康检查 ----------------
-func checkBackendHealth(backend string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.HealthCheckTimeout)*time.Second)
-	defer cancel()
-
-	// 尝试连接后端
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, "ws://"+backend, nil)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
+type wsWriteConn struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
 }
 
-func startHealthCheck() {
-	ticker := time.NewTicker(time.Duration(cfg.Limits.HealthCheckInterval) * time.Second)
-	defer ticker.Stop()
+func (w *wsWriteConn) WriteMessage(messageType int, data []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteMessage(messageType, data)
+}
 
-	for range ticker.C {
-		backendsMu.RLock()
-		currentBackends := make([]string, len(backends))
-		copy(currentBackends, backends)
-		backendsMu.RUnlock()
-
-		for _, backend := range currentBackends {
-			currentHealthy := checkBackendHealth(backend)
-
-			healthMu.Lock()
-			previousHealthy := backendHealth[backend]
-			backendHealth[backend] = currentHealthy
-			healthMu.Unlock()
-
-			if currentHealthy {
-				backendHealthMetric.WithLabelValues(backend).Set(1)
-			} else {
-				backendHealthMetric.WithLabelValues(backend).Set(0)
-			}
-
-			if previousHealthy != currentHealthy {
-				if currentHealthy {
-					log.Println("后端恢复健康:", backend)
-				} else {
-					log.Println("后端变为不健康:", backend)
-				}
-			}
-		}
-	}
+func (w *wsWriteConn) WriteControl(messageType int, data []byte, deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteControl(messageType, data, deadline)
 }
 
 func isDialFailure(err error) bool {
@@ -852,6 +791,204 @@ func isDialFailure(err error) bool {
 
 	errText := strings.ToLower(err.Error())
 	return strings.Contains(errText, "dial tcp") || strings.Contains(errText, "connection refused")
+}
+
+func readCPUSnapshot() (cpuSnapshot, error) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return cpuSnapshot{}, err
+	}
+	line := strings.SplitN(string(data), "\n", 2)[0]
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return cpuSnapshot{}, fmt.Errorf("invalid /proc/stat format")
+	}
+
+	var total uint64
+	values := make([]uint64, 0, len(fields)-1)
+	for _, field := range fields[1:] {
+		v, parseErr := strconv.ParseUint(field, 10, 64)
+		if parseErr != nil {
+			return cpuSnapshot{}, parseErr
+		}
+		total += v
+		values = append(values, v)
+	}
+
+	idle := values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+
+	return cpuSnapshot{total: total, idle: idle}, nil
+}
+
+func cpuUsagePercent(prev cpuSnapshot, curr cpuSnapshot) (float64, bool) {
+	if curr.total <= prev.total || curr.idle < prev.idle {
+		return 0, false
+	}
+	totalDelta := curr.total - prev.total
+	if totalDelta == 0 {
+		return 0, false
+	}
+	idleDelta := curr.idle - prev.idle
+	used := float64(totalDelta-idleDelta) / float64(totalDelta) * 100
+	if used < 0 {
+		used = 0
+	}
+	if used > 100 {
+		used = 100
+	}
+	return used, true
+}
+
+func readLoadPerCPU() (float64, error) {
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("invalid /proc/loadavg format")
+	}
+	load1, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, err
+	}
+	cpuCount := runtime.NumCPU()
+	if cpuCount <= 0 {
+		cpuCount = 1
+	}
+	return load1 / float64(cpuCount), nil
+}
+
+func readMemoryUsagePercent() (float64, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	var total float64
+	var available float64
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "MemTotal:":
+			total, err = strconv.ParseFloat(fields[1], 64)
+			if err != nil {
+				return 0, err
+			}
+		case "MemAvailable:":
+			available, err = strconv.ParseFloat(fields[1], 64)
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
+	if total <= 0 {
+		return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
+	}
+	if available < 0 {
+		available = 0
+	}
+	used := (total - available) / total * 100
+	if used < 0 {
+		used = 0
+	}
+	if used > 100 {
+		used = 100
+	}
+	return used, nil
+}
+
+func evaluateMachineHealth() (bool, string) {
+	if runtime.GOOS != "linux" {
+		return true, ""
+	}
+
+	reasons := make([]string, 0, 3)
+
+	if curr, err := readCPUSnapshot(); err == nil {
+		machineHealthMu.Lock()
+		if machineHasPrevCPU {
+			if usage, ok := cpuUsagePercent(machinePrevCPUSnapshot, curr); ok && usage > cfg.Limits.MachineMaxCPUPercent {
+				reasons = append(reasons, fmt.Sprintf("cpu=%.1f%%", usage))
+			}
+		}
+		machinePrevCPUSnapshot = curr
+		machineHasPrevCPU = true
+		machineHealthMu.Unlock()
+	}
+
+	if loadPerCPU, err := readLoadPerCPU(); err == nil {
+		if loadPerCPU > cfg.Limits.MachineMaxLoadPerCPU {
+			reasons = append(reasons, fmt.Sprintf("loadPerCPU=%.2f", loadPerCPU))
+		}
+	}
+
+	if memPercent, err := readMemoryUsagePercent(); err == nil {
+		if memPercent > cfg.Limits.MachineMaxMemoryPercent {
+			reasons = append(reasons, fmt.Sprintf("mem=%.1f%%", memPercent))
+		}
+	}
+
+	if len(reasons) == 0 {
+		return true, ""
+	}
+	return false, strings.Join(reasons, ",")
+}
+
+func updateMachineCircuitState(healthy bool, reason string) {
+	machineHealthMu.Lock()
+	defer machineHealthMu.Unlock()
+
+	if healthy {
+		machineUnhealthyStreak = 0
+		machineHealthyStreak++
+		if machineCircuitOpen.Load() && machineHealthyStreak >= cfg.Limits.MachineRecoveryThreshold {
+			machineCircuitOpen.Store(false)
+			machineCircuitReason.Store("")
+			log.Println("机器健康熔断已恢复")
+		}
+		return
+	}
+
+	machineHealthyStreak = 0
+	machineUnhealthyStreak++
+	machineCircuitReason.Store(reason)
+	if !machineCircuitOpen.Load() && machineUnhealthyStreak >= cfg.Limits.MachineUnhealthyThreshold {
+		machineCircuitOpen.Store(true)
+		log.Printf("机器健康熔断已触发: %s", reason)
+	}
+}
+
+func machineCircuitStatus() (bool, string) {
+	if !machineCircuitOpen.Load() {
+		return false, ""
+	}
+	reason, _ := machineCircuitReason.Load().(string)
+	return true, reason
+}
+
+func startMachineHealthCircuitBreaker() {
+	if runtime.GOOS != "linux" {
+		log.Println("机器健康熔断仅支持 Linux，当前系统跳过")
+		return
+	}
+
+	check := func() {
+		healthy, reason := evaluateMachineHealth()
+		updateMachineCircuitState(healthy, reason)
+	}
+
+	check()
+	ticker := time.NewTicker(time.Duration(cfg.Limits.MachineHealthCheckSec) * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		check()
+	}
 }
 
 func validateRequestHeaders(headers http.Header) bool {
@@ -883,54 +1020,14 @@ func validateRequestHeaders(headers http.Header) bool {
 	return true
 }
 
-// ---------------- 负载均衡 ----------------
-func pickBackend(ip string, sticky bool) string {
-	backendsMu.RLock()
-	defer backendsMu.RUnlock()
-	if len(backends) == 0 {
-		return ""
-	}
-
-	// 获取健康的后端列表
-	healthMu.RLock()
-	defer healthMu.RUnlock()
-
-	var healthyBackends []string
-	for _, backend := range backends {
-		if backendHealth[backend] {
-			healthyBackends = append(healthyBackends, backend)
-		}
-	}
-
-	if len(healthyBackends) == 0 {
-		// 如果没有健康的后端，返回第一个（fallback）
-		return backends[0]
-	}
-
-	if sticky && ip != "" {
-		// 粘性负载均衡：基于IP哈希，确保同一IP总是路由到同一后端
-		hash := 0
-		for _, c := range ip {
-			hash = hash*31 + int(c)
-		}
-		if hash < 0 {
-			hash = -hash
-		}
-		return healthyBackends[hash%len(healthyBackends)]
-	}
-
-	// 轮询负载均衡
-	idx := atomic.AddUint64(&backendIndex, 1) - 1
-	return healthyBackends[idx%uint64(len(healthyBackends))]
-}
-
 // ---------------- HTTP代理处理器 ----------------
 func httpProxyHandler(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	totalRequests.WithLabelValues(r.Method, r.URL.Path).Inc()
 	if !validateRequestHeaders(r.Header) {
-		rateLimitRejections.WithLabelValues("http_header").Inc()
 		http.Error(w, "Request Header Fields Too Large", http.StatusRequestHeaderFieldsTooLarge)
+		return
+	}
+	if open, _ := machineCircuitStatus(); open {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -942,11 +1039,6 @@ func httpProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-connSem }()
-
-	// 记录指标
-	totalConnections.WithLabelValues("http").Inc()
-	activeConnections.WithLabelValues("http").Inc()
-	defer activeConnections.WithLabelValues("http").Dec()
 
 	ctx := context.Background()
 	ip := getClientIP(r)
@@ -965,54 +1057,30 @@ func httpProxyHandler(w http.ResponseWriter, r *http.Request) {
 		if reason == "ip" {
 			banIP(ctx, ip)
 		}
-		rateLimitRejections.WithLabelValues("http_" + reason).Inc()
 		http.Error(w, "Too many requests", 429)
 		return
 	}
 
-	// 选择后端（非粘性，使用轮询）
-	target := pickBackend(ip, false)
-	if target == "" {
-		http.Error(w, "No backend available", 503)
-		return
-	}
-	targetURL, err := url.Parse("http://" + target)
-	if err != nil {
-		log.Println("解析目标URL失败:", err)
+	// 使用单一后端
+	loadedProxy := httpReverseProxy.Load()
+	proxy, ok := loadedProxy.(*httputil.ReverseProxy)
+	if !ok || proxy == nil {
 		http.Error(w, "Bad Gateway", 502)
 		return
-	}
-
-	// 创建反向代理
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second,
-		MaxResponseHeaderBytes: 1 << 20,
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Println("代理错误:", err)
-		http.Error(w, "Bad Gateway", 502)
 	}
 
 	// 添加X-Forwarded-For头
 	r.Header.Set("X-Forwarded-For", ip)
 
 	proxy.ServeHTTP(w, r)
-
-	// 记录请求持续时间
-	duration := time.Since(start).Seconds()
-	requestDuration.WithLabelValues("http").Observe(duration)
 }
 
 // ---------------- WebSocket代理处理器 ----------------
 func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
+	if open, _ := machineCircuitStatus(); open {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	// 全局连接数限制（防止攻击时创建过多 goroutine）
 	select {
@@ -1022,11 +1090,6 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-connSem }()
-
-	// 记录指标
-	totalConnections.WithLabelValues("websocket").Inc()
-	activeConnections.WithLabelValues("websocket").Inc()
-	defer activeConnections.WithLabelValues("websocket").Dec()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.WebSocketMaxLifetimeSec)*time.Second)
 	defer cancel()
@@ -1044,7 +1107,6 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 		if reason == "ip" {
 			banIP(ctx, ip)
 		}
-		rateLimitRejections.WithLabelValues("ws_rate_" + reason).Inc()
 		http.Error(w, "Too many requests", 429)
 		return
 	}
@@ -1063,7 +1125,6 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !allowed {
-		rateLimitRejections.WithLabelValues("ws_conn").Inc()
 		http.Error(w, "Too many connections", 429)
 		return
 	}
@@ -1076,31 +1137,21 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	var clientWriteMu sync.Mutex
+	clientWS := &wsWriteConn{conn: conn}
 
 	// 心跳
-	heartbeat(conn, &clientWriteMu, ctx, cancel)
+	heartbeat(clientWS, ctx, cancel)
 
-	// 后端（粘性负载均衡）
-	target := pickBackend(ip, true)
-	if target == "" {
-		clientWriteMu.Lock()
-		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "no backend available"))
-		clientWriteMu.Unlock()
-		return
-	}
+	// 使用单一后端
+	target := cfg.Backend
 	targetConn, _, err := websocket.DefaultDialer.Dial("ws://"+target, nil)
 	if err != nil {
 		log.Println("后端连接失败:", target, err)
-		// 标记后端为不健康
-		healthMu.Lock()
-		backendHealth[target] = false
-		healthMu.Unlock()
-		// 更新 Prometheus 指标
-		backendHealthMetric.WithLabelValues(target).Set(0)
+		_ = clientWS.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "backend connection error"))
 		return
 	}
 	defer targetConn.Close()
+	backendWS := &wsWriteConn{conn: targetConn}
 	maxWSMessageSize := int64(cfg.Limits.MaxBodySizeMB) * 1024 * 1024
 	if maxWSMessageSize <= 0 {
 		maxWSMessageSize = 10 * 1024 * 1024
@@ -1108,88 +1159,66 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxWSMessageSize)
 	targetConn.SetReadLimit(maxWSMessageSize)
 
-	var wg sync.WaitGroup
-	done := make(chan struct{})
-	var targetWriteMu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
 
-	// client → backend
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	g.Go(func() error {
 		const wsReadTimeout = 65 * time.Second
 		for {
-			select {
-			case <-done:
-				return
-			default:
-				conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-				mt, msg, err := conn.ReadMessage()
-				if err != nil {
-					cancel()
-					return
+			_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+			mt, msg, err := conn.ReadMessage()
+			if err != nil {
+				if gctx.Err() != nil {
+					return gctx.Err()
 				}
+				return err
+			}
 
-				if allowed, reason := allowRequestWithReason(ctx, ip); !allowed {
-					if reason == "ip" {
-						banIP(ctx, ip)
-					}
-					cancel()
-					return
+			if allowed, reason := allowRequestWithReason(ctx, ip); !allowed {
+				if reason == "ip" {
+					banIP(ctx, ip)
 				}
+				return fmt.Errorf("websocket message rejected by rate limit: %s", reason)
+			}
 
-				targetWriteMu.Lock()
-				err = targetConn.WriteMessage(mt, msg)
-				targetWriteMu.Unlock()
-				if err != nil {
-					cancel()
-					return
-				}
+			if err := backendWS.WriteMessage(mt, msg); err != nil {
+				return err
 			}
 		}
-	}()
+	})
 
-	// backend → client
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	g.Go(func() error {
 		const backendReadTimeout = 65 * time.Second
 		for {
-			select {
-			case <-done:
-				return
-			default:
-				targetConn.SetReadDeadline(time.Now().Add(backendReadTimeout))
-				mt, msg, err := targetConn.ReadMessage()
-				if err != nil {
-					cancel()
-					return
+			_ = targetConn.SetReadDeadline(time.Now().Add(backendReadTimeout))
+			mt, msg, err := targetConn.ReadMessage()
+			if err != nil {
+				if gctx.Err() != nil {
+					return gctx.Err()
 				}
-				clientWriteMu.Lock()
-				err = conn.WriteMessage(mt, msg)
-				clientWriteMu.Unlock()
-				if err != nil {
-					cancel()
-					return
-				}
+				return err
+			}
+
+			if err := clientWS.WriteMessage(mt, msg); err != nil {
+				return err
 			}
 		}
-	}()
+	})
 
-	// 等待任一方向出错
-	<-ctx.Done()
-	if ctx.Err() == context.DeadlineExceeded {
-		clientWriteMu.Lock()
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "connection lifetime exceeded"), time.Now().Add(time.Second))
-		clientWriteMu.Unlock()
+	g.Go(func() error {
+		<-gctx.Done()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			_ = clientWS.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "connection lifetime exceeded"), time.Now().Add(time.Second))
+		}
+		_ = conn.Close()
+		_ = targetConn.Close()
+		return nil
+	})
+
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+			log.Println("WebSocket proxy error:", err)
+		}
 	}
-	close(done)
-	_ = conn.Close()
-	_ = targetConn.Close()
-	wg.Wait()
-
-	// 记录请求持续时间
-	duration := time.Since(start).Seconds()
-	requestDuration.WithLabelValues("websocket").Observe(duration)
 }
 
 // ---------------- 核心代理 ----------------
@@ -1355,12 +1384,9 @@ func main() {
 
 	// 启动配置文件监听
 	go watchConfig()
-
-	// 启动后端健康检查
-	go startHealthCheck()
+	go startMachineHealthCircuitBreaker()
 
 	http.HandleFunc("/", proxyHandler)
-	http.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:         ":" + port,

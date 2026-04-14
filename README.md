@@ -1,11 +1,11 @@
 # golang-iptables
 
-WebSocket 网关代理服务，支持高并发、负载均衡、限流和 IP 封禁。
+WebSocket 网关代理服务，支持高并发、单后端防护转发、限流和 IP 封禁。
 
 ## 功能特性
 
 - **HTTP/WebSocket 代理**：支持 HTTP 和 WebSocket 两种协议的代理转发
-- **粘性负载均衡**：WebSocket 使用 IP 哈希实现粘性会话，HTTP 使用轮询负载均衡
+- **单后端代理**：HTTP/WebSocket 均转发到单一后端，专注防护能力
 - **连接数限制**：基于 Redis 的分布式连接数控制（可配置）
 - **滑动窗口限流**：基于 Redis 的滑动窗口限流（可配置）
 - **IP 黑名单**：自动封禁超限 IP，并同步到 ipset
@@ -31,10 +31,7 @@ go mod download
 
 ```json
 {
-  "backends": [
-    "127.0.0.1:9502",
-    "127.0.0.1:9503"
-  ],
+  "backend": "127.0.0.1:9502",
   "redis": {
     "addr": "127.0.0.1:6379",
     "db": 14,
@@ -51,27 +48,30 @@ go mod download
   },
   "trustedProxies": [
     "127.0.0.1/8",
-    "::1/128",
-    "10.0.0.0/8"
+    "::1/128"
   ],
   "limits": {
-    "maxConnections": 5000,
-    "maxBodySizeMB": 10,
-    "webSocketBufferSize": 1048576,
-    "webSocketMaxLifetimeSec": 7200,
-    "ipsetConcurrency": 10,
-    "ipsetTimeoutSec": 5,
+    "maxConnections": 2000,
+    "maxBodySizeMB": 2,
+    "webSocketBufferSize": 262144,
+    "webSocketMaxLifetimeSec": 1800,
+    "ipsetConcurrency": 20,
+    "ipsetTimeoutSec": 3,
+    "machineHealthCheckSec": 2,
+    "machineMaxCPUPercent": 92,
+    "machineMaxLoadPerCpu": 1.5,
+    "machineMaxMemoryPercent": 95,
+    "machineUnhealthyThreshold": 3,
+    "machineRecoveryThreshold": 3,
     "authTimeoutSec": 3,
-    "healthCheckInterval": 30,
-    "healthCheckTimeout": 3,
-    "shutdownTimeoutSec": 30
+    "shutdownTimeoutSec": 15
   }
 }
 ```
 
 ### 配置说明
 
-- `backends`：后端服务地址列表（支持 HTTP 和 WebSocket）
+- `backend`：单一后端服务地址（支持 HTTP 和 WebSocket）
 - `redis.addr`：Redis 服务器地址
 - `redis.db`：Redis 数据库编号
 - `redis.password`：Redis 密码（无密码留空）
@@ -87,9 +87,13 @@ go mod download
 - `limits.webSocketMaxLifetimeSec`：WebSocket 最大连接生命周期（秒，默认 7200）
 - `limits.ipsetConcurrency`：ipset 并发数（默认 10）
 - `limits.ipsetTimeoutSec`：ipset 命令超时（秒，默认 5）
+- `limits.machineHealthCheckSec`：机器健康检查间隔（秒，默认 2）
+- `limits.machineMaxCPUPercent`：CPU 使用率熔断阈值（%，默认 92）
+- `limits.machineMaxLoadPerCpu`：每核 Load 熔断阈值（默认 1.5）
+- `limits.machineMaxMemoryPercent`：内存使用率熔断阈值（%，默认 95）
+- `limits.machineUnhealthyThreshold`：连续异常次数触发熔断（默认 3）
+- `limits.machineRecoveryThreshold`：连续恢复次数关闭熔断（默认 3）
 - `limits.authTimeoutSec`：认证超时（保留字段，当前版本未使用）
-- `limits.healthCheckInterval`：健康检查间隔（秒，默认 30）
-- `limits.healthCheckTimeout`：健康检查超时（秒，默认 3）
 - `limits.shutdownTimeoutSec`：优雅关闭超时（秒，默认 30）
 
 ## 启动
@@ -168,7 +172,7 @@ ws.onopen = () => {
 **接入流程：**
 
 1. 客户端发送 HTTP 请求到网关
-2. 网关使用轮询负载均衡选择后端
+2. 网关将请求转发到单一后端
 3. 请求转发到后端，响应返回给客户端
 
 **客户端代码示例：**
@@ -187,14 +191,18 @@ fetch('http://localhost:8080/api/test', {
 });
 ```
 
-**负载均衡说明：**
-- HTTP 使用轮询模式，每个请求可能分发到不同后端
-- 如果需要粘性会话（同一 IP 固定到同一后端），需修改代码为粘性模式
-- 仅健康的后端会被纳入负载均衡
+**后端路由说明：**
+- 当前为单后端模式，HTTP/WebSocket 均转发到 `backend`
+
+### 机器健康熔断
+
+- 网关会后台采样机器健康指标（Linux）：CPU、每核 Load、内存占用
+- 当连续 `limits.machineUnhealthyThreshold` 次超过阈值时，自动熔断并返回 `503`
+- 当连续 `limits.machineRecoveryThreshold` 次恢复健康后，自动退出熔断
+- 建议结合 `config.emergency.json` 在高压时进一步收紧限流
 
 **HTTP 安全与连接保护：**
 - 已启用 `ReadHeaderTimeout`、`IdleTimeout` 和 `MaxHeaderBytes`，用于缓解 Slowloris 和超大 Header 攻击
-- 请求总量已统计到 `gateway_total_requests`
 
 ### 后端服务要求
 
