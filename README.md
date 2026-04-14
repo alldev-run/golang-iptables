@@ -248,4 +248,9 @@ sudo ipset del blacklist 1.2.3.4
 
 ## 许可证
 
-MIT License
+Apache License 2.0（`Apache-2.0`），详见 `LICENSE` 文件。
+
+## 作者
+
+- John James
+- 邮箱：nbjohn999@gmail.com
