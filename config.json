@@ -1,0 +1,32 @@
+{
+  "backends": [
+    "127.0.0.1:9502",
+    "127.0.0.1:9503"
+  ],
+  "redis": {
+    "addr": "127.0.0.1:6379",
+    "db": 14,
+    "password": ""
+  },
+  "rateLimit": {
+    "maxRequests": 100,
+    "globalMaxRequests": 5000,
+    "windowSec": 10,
+    "maxConn": 5
+  },
+  "auth": {
+    "token": "123456"
+  },
+  "limits": {
+    "maxConnections": 5000,
+    "maxBodySizeMB": 10,
+    "webSocketBufferSize": 1048576,
+    "webSocketMaxLifetimeSec": 7200,
+    "ipsetConcurrency": 10,
+    "ipsetTimeoutSec": 5,
+    "authTimeoutSec": 3,
+    "healthCheckInterval": 30,
+    "healthCheckTimeout": 3,
+    "shutdownTimeoutSec": 30
+  }
+}
