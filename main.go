@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -81,6 +82,9 @@ return 0
 	// 全局配置
 	cfg Config
 
+	trustedProxyMu   sync.RWMutex
+	trustedProxyNets []*net.IPNet
+
 	// Prometheus metrics
 	totalConnections = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -140,11 +144,12 @@ return 0
 )
 
 type Config struct {
-	Backends  []string        `json:"backends"`
-	Redis     RedisConfig     `json:"redis"`
-	RateLimit RateLimitConfig `json:"rateLimit"`
-	Auth      AuthConfig      `json:"auth"`
-	Limits    LimitConfig     `json:"limits"`
+	Backends       []string        `json:"backends"`
+	Redis          RedisConfig     `json:"redis"`
+	RateLimit      RateLimitConfig `json:"rateLimit"`
+	Auth           AuthConfig      `json:"auth"`
+	TrustedProxies []string        `json:"trustedProxies"`
+	Limits         LimitConfig     `json:"limits"`
 }
 
 type RedisConfig struct {
@@ -194,6 +199,7 @@ func defaultConfig() Config {
 		Auth: AuthConfig{
 			Token: "123456",
 		},
+		TrustedProxies: []string{"127.0.0.1/8", "::1/128"},
 		Limits: LimitConfig{
 			MaxConnections:      5000,
 			MaxBodySizeMB:       10,
@@ -224,6 +230,24 @@ func normalizeConfig(c *Config) {
 		filteredBackends = append(filteredBackends, backend)
 	}
 	c.Backends = filteredBackends
+
+	filteredTrustedProxies := make([]string, 0, len(c.TrustedProxies))
+	seenTrustedProxies := make(map[string]struct{}, len(c.TrustedProxies))
+	for _, proxy := range c.TrustedProxies {
+		proxy = strings.TrimSpace(proxy)
+		if proxy == "" {
+			continue
+		}
+		if _, exists := seenTrustedProxies[proxy]; exists {
+			continue
+		}
+		seenTrustedProxies[proxy] = struct{}{}
+		filteredTrustedProxies = append(filteredTrustedProxies, proxy)
+	}
+	if len(filteredTrustedProxies) == 0 {
+		filteredTrustedProxies = []string{"127.0.0.1/8", "::1/128"}
+	}
+	c.TrustedProxies = filteredTrustedProxies
 
 	if c.RateLimit.MaxRequests <= 0 {
 		c.RateLimit.MaxRequests = 100
@@ -270,13 +294,77 @@ func normalizeConfig(c *Config) {
 	}
 }
 
+func parseTrustedProxy(entry string) (*net.IPNet, error) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return nil, fmt.Errorf("empty trusted proxy")
+	}
+
+	if strings.Contains(entry, "/") {
+		_, ipNet, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", entry, err)
+		}
+		return ipNet, nil
+	}
+
+	ip := net.ParseIP(entry)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid trusted proxy IP %q", entry)
+	}
+
+	bits := 32
+	if ip.To4() == nil {
+		bits = 128
+	}
+
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}, nil
+}
+
+func buildTrustedProxyNets(entries []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		ipNet, err := parseTrustedProxy(entry)
+		if err != nil {
+			return nil, err
+		}
+		nets = append(nets, ipNet)
+	}
+	return nets, nil
+}
+
+func isTrustedProxyIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+
+	trustedProxyMu.RLock()
+	defer trustedProxyMu.RUnlock()
+
+	for _, ipNet := range trustedProxyNets {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func applyConfig(newCfg Config) error {
 	normalizeConfig(&newCfg)
 	if len(newCfg.Backends) == 0 {
 		return fmt.Errorf("配置文件中 backends 不能为空")
 	}
 
+	parsedTrustedProxyNets, err := buildTrustedProxyNets(newCfg.TrustedProxies)
+	if err != nil {
+		return fmt.Errorf("trustedProxies 配置无效: %w", err)
+	}
+
 	cfg = newCfg
+	trustedProxyMu.Lock()
+	trustedProxyNets = parsedTrustedProxyNets
+	trustedProxyMu.Unlock()
 
 	backendsMu.Lock()
 	backends = append(backends[:0], cfg.Backends...)
@@ -416,8 +504,8 @@ func getClientIP(r *http.Request) string {
 		return remoteHost
 	}
 
-	// 仅在本地回环代理场景下信任 X-Forwarded-For，避免被外部直连请求伪造
-	if remoteIP.IsLoopback() {
+	// 仅在可信代理来源下信任 X-Forwarded-For，避免被外部直连请求伪造
+	if remoteIP.IsLoopback() || isTrustedProxyIP(remoteIP) {
 		xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
 		if xff != "" {
 			first := strings.TrimSpace(strings.Split(xff, ",")[0])
@@ -745,6 +833,25 @@ func startHealthCheck() {
 			}
 		}
 	}
+}
+
+func isDialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && strings.EqualFold(opErr.Op, "dial") {
+		return true
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return isDialFailure(urlErr.Err)
+	}
+
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "dial tcp") || strings.Contains(errText, "connection refused")
 }
 
 func validateRequestHeaders(headers http.Header) bool {

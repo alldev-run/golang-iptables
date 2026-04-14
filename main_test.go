@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -60,6 +63,31 @@ func TestGetClientIP(t *testing.T) {
 				t.Errorf("getClientIP() = %v, want %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestGetClientIP_TrustedProxy(t *testing.T) {
+	originalCfg := cfg
+	originalTrusted := trustedProxyNets
+	defer func() {
+		cfg = originalCfg
+		trustedProxyMu.Lock()
+		trustedProxyNets = originalTrusted
+		trustedProxyMu.Unlock()
+	}()
+
+	newCfg := defaultConfig()
+	newCfg.TrustedProxies = []string{"10.0.0.0/8", "192.168.0.1"}
+	if err := applyConfig(newCfg); err != nil {
+		t.Fatalf("applyConfig() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.10.10.10:1234"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
+
+	if got := getClientIP(req); got != "1.2.3.4" {
+		t.Fatalf("trusted proxy 场景 getClientIP() = %v, want %v", got, "1.2.3.4")
 	}
 }
 
@@ -160,6 +188,27 @@ func TestLoadConfig(t *testing.T) {
 		configFile = "/tmp/nonexistent.json"
 		if err := loadConfig(); err == nil {
 			t.Error("期望返回错误，但返回 nil")
+		}
+	})
+
+	// 测试 trustedProxies 非法配置
+	t.Run("trustedProxies 非法配置", func(t *testing.T) {
+		testConfig := `{
+			"backends": ["127.0.0.1:9502"],
+			"redis": {
+				"addr": "127.0.0.1:16379",
+				"db": 14,
+				"password": ""
+			},
+			"trustedProxies": ["bad-cidr"]
+		}`
+
+		if err := writeTestConfig(tempFile, testConfig); err != nil {
+			t.Fatalf("写入测试配置失败: %v", err)
+		}
+
+		if err := loadConfig(); err == nil {
+			t.Error("期望 trustedProxies 非法时报错，但返回 nil")
 		}
 	})
 }
@@ -458,6 +507,56 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 	}
 	if ttlLevel3 < 9*time.Minute {
 		t.Fatalf("3 级封禁 TTL 应接近 10 分钟，当前=%s", ttlLevel3)
+	}
+}
+
+func TestIsDialFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil 错误",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "net.OpError dial",
+			err: &net.OpError{
+				Op:  "dial",
+				Err: errors.New("connection refused"),
+			},
+			want: true,
+		},
+		{
+			name: "url.Error 包装 dial 错误",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "http://127.0.0.1:9503",
+				Err: &net.OpError{Op: "dial", Err: errors.New("connect: connection refused")},
+			},
+			want: true,
+		},
+		{
+			name: "字符串匹配 dial tcp",
+			err:  errors.New("dial tcp 127.0.0.1:9503: connect: connection refused"),
+			want: true,
+		},
+		{
+			name: "非拨号错误",
+			err:  errors.New("unexpected EOF"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isDialFailure(tt.err)
+			if got != tt.want {
+				t.Fatalf("isDialFailure() = %v, want %v, err=%v", got, tt.want, tt.err)
+			}
+		})
 	}
 }
 

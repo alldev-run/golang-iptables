@@ -49,6 +49,11 @@ go mod download
   "auth": {
     "token": "123456"
   },
+  "trustedProxies": [
+    "127.0.0.1/8",
+    "::1/128",
+    "10.0.0.0/8"
+  ],
   "limits": {
     "maxConnections": 5000,
     "maxBodySizeMB": 10,
@@ -75,6 +80,7 @@ go mod download
 - `rateLimit.windowSec`：限流窗口时间（秒，默认 10）
 - `rateLimit.maxConn`：单个 IP 最大并发连接数（默认 5）
 - `auth.token`：WebSocket Upgrade 前 Header 鉴权 token
+- `trustedProxies`：可信代理来源列表（支持 IP/CIDR），仅来自这些地址时才信任 `X-Forwarded-For`
 - `limits.maxConnections`：全局最大连接数（默认 5000）
 - `limits.maxBodySizeMB`：HTTP 请求体最大大小（MB，默认 10）
 - `limits.webSocketBufferSize`：WebSocket 缓冲区大小（bytes，默认 1048576）
@@ -244,7 +250,7 @@ sudo ipset del blacklist 1.2.3.4
 2. ipset 需要管理员权限，确保运行用户有权限执行 ipset 命令
 3. 配置文件热重载支持 backends、rateLimit 和 auth 配置，Redis 配置修改需要重启服务
 4. 鉴权 token 通过配置文件 `auth.token` 设置，生产环境请使用安全的 token
-5. `X-Forwarded-For` 仅在本地回环代理场景被信任，外部直连请求不能依赖伪造 XFF
+5. `X-Forwarded-For` 仅在可信代理来源（`trustedProxies`）下被信任，外部直连请求不能依赖伪造 XFF
 
 ## 许可证
 
