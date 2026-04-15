@@ -132,6 +132,7 @@ return 0
 type Config struct {
 	Backend        string          `json:"backend"`
 	Redis          RedisConfig     `json:"redis"`
+	Cluster        ClusterConfig   `json:"cluster"`
 	RateLimit      RateLimitConfig `json:"rateLimit"`
 	Auth           AuthConfig      `json:"auth"`
 	TrustedProxies []string        `json:"trustedProxies"`
@@ -220,6 +221,20 @@ func defaultConfig() Config {
 			Addr:     "127.0.0.1:6379",
 			DB:       14,
 			Password: "",
+		},
+		Cluster: ClusterConfig{
+			Enable:         false,
+			BindAddr:       "",
+			BindPort:       7946,
+			Join:           nil,
+			SourceAllowCIDRs: nil,
+			Secret:         "",
+			RetransmitMult: 3,
+			NodeName:       "",
+			PublishQueueSize: 1024,
+			PublishBatchSize: 32,
+			PublishFlushMs:   100,
+			PublishMaxPerSec: 500,
 		},
 		RateLimit: RateLimitConfig{
 			MaxRequests:       100,
@@ -396,6 +411,57 @@ func normalizeConfig(c *Config) {
 	if c.Limits.ShutdownTimeoutSec <= 0 {
 		c.Limits.ShutdownTimeoutSec = 30
 	}
+
+	if c.Cluster.BindPort <= 0 {
+		c.Cluster.BindPort = 7946
+	}
+	c.Cluster.BindAddr = strings.TrimSpace(c.Cluster.BindAddr)
+	c.Cluster.NodeName = strings.TrimSpace(c.Cluster.NodeName)
+	c.Cluster.Secret = strings.TrimSpace(c.Cluster.Secret)
+	if c.Cluster.RetransmitMult <= 0 {
+		c.Cluster.RetransmitMult = 3
+	}
+	if c.Cluster.PublishQueueSize <= 0 {
+		c.Cluster.PublishQueueSize = 1024
+	}
+	if c.Cluster.PublishBatchSize <= 0 {
+		c.Cluster.PublishBatchSize = 32
+	}
+	if c.Cluster.PublishFlushMs <= 0 {
+		c.Cluster.PublishFlushMs = 100
+	}
+	if c.Cluster.PublishMaxPerSec <= 0 {
+		c.Cluster.PublishMaxPerSec = 500
+	}
+	filteredJoin := make([]string, 0, len(c.Cluster.Join))
+	seenJoin := make(map[string]struct{}, len(c.Cluster.Join))
+	for _, peer := range c.Cluster.Join {
+		peer = strings.TrimSpace(peer)
+		if peer == "" {
+			continue
+		}
+		if _, exists := seenJoin[peer]; exists {
+			continue
+		}
+		seenJoin[peer] = struct{}{}
+		filteredJoin = append(filteredJoin, peer)
+	}
+	c.Cluster.Join = filteredJoin
+
+	filteredAllowCIDRs := make([]string, 0, len(c.Cluster.SourceAllowCIDRs))
+	seenAllowCIDRs := make(map[string]struct{}, len(c.Cluster.SourceAllowCIDRs))
+	for _, cidr := range c.Cluster.SourceAllowCIDRs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		if _, exists := seenAllowCIDRs[cidr]; exists {
+			continue
+		}
+		seenAllowCIDRs[cidr] = struct{}{}
+		filteredAllowCIDRs = append(filteredAllowCIDRs, cidr)
+	}
+	c.Cluster.SourceAllowCIDRs = filteredAllowCIDRs
 }
 
 func parseTrustedProxy(entry string) (*net.IPNet, error) {
@@ -984,6 +1050,7 @@ func banIP(ctx context.Context, ip string) {
 
 	cacheBlacklistLocal(ip, banDuration)
 	syncIPSetBan(ip, banDuration)
+	publishBanEvent(ip, banDuration, banLevel)
 }
 
 // ---------------- 分布式连接数 ----------------
@@ -1166,6 +1233,7 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 
 	cacheBlacklistLocal(ipStr, duration)
 	syncIPSetBan(ipStr, duration)
+	publishBanEvent(ipStr, duration, 3)
 	if !redisPersisted {
 		log.Printf("Admin ban 已走本地兜底: ip=%s, duration=%v", ipStr, duration)
 	}
@@ -1880,6 +1948,7 @@ func main() {
 	go startIPSetSync()
 	go startIPSetCleanup()
 	startIPSetWorkers()
+	startClusterMesh()
 
 	http.HandleFunc("/", proxyHandler)
 	http.HandleFunc("/admin/ban", adminBanHandler)
@@ -1910,6 +1979,7 @@ func main() {
 
 	stopIPSetCleanup()
 	stopIPSetWorkers()
+	stopClusterMesh()
 
 	// 优雅关闭，等待现有请求完成
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.ShutdownTimeoutSec)*time.Second)
@@ -1956,9 +2026,11 @@ func applyLocalFallbackBan(ip string, reason string) {
 		return
 	}
 	banDuration := calculateCumulativeLocalBanDuration(ip, banIncrement)
+	banLevel := banLevelByStrikes(strikes)
 
 	cacheBlacklistLocal(ip, banDuration)
 	syncIPSetBan(ip, banDuration)
+	publishBanEvent(ip, banDuration, banLevel)
 	log.Printf("本地兜底封禁生效: ip=%s, strikes=%d, duration=%s, reason=%s", ip, strikes, banDuration, reason)
 }
 

@@ -5,6 +5,20 @@
     "db": 14,
     "password": ""
   },
+  "cluster": {
+    "enable": false,
+    "bindAddr": "0.0.0.0",
+    "bindPort": 7946,
+    "join": [],
+    "sourceAllowCidrs": [],
+    "secret": "",
+    "retransmitMult": 3,
+    "nodeName": "",
+    "publishQueueSize": 1024,
+    "publishBatchSize": 32,
+    "publishFlushMs": 100,
+    "publishMaxPerSec": 500
+  },
   "rateLimit": {
     "maxRequests": 20,
     "globalMaxRequests": 800,
