@@ -38,6 +38,9 @@
     "machineUnhealthyThreshold": 3,
     "machineRecoveryThreshold": 3,
     "ipsetSyncIntervalSec": 30,
+    "ipsetCacheMaxEntries": 200000,
+    "ipsetSyncMaxPerRound": 50000,
+    "blacklistIpKeyMaxLen": 64,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }

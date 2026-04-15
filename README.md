@@ -72,6 +72,9 @@ go mod download
     "machineUnhealthyThreshold": 3,
     "machineRecoveryThreshold": 3,
     "ipsetSyncIntervalSec": 30,
+    "ipsetCacheMaxEntries": 200000,
+    "ipsetSyncMaxPerRound": 50000,
+    "blacklistIpKeyMaxLen": 64,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }
@@ -100,6 +103,9 @@ go mod download
 - `limits.ipsetConcurrency`：ipset 并发数（默认 10）
 - `limits.ipsetTimeoutSec`：ipset 命令超时（秒，默认 5）
 - `limits.ipsetSyncIntervalSec`：ipset 从 Redis 同步间隔（秒，默认 30，0 表示不同步）
+- `limits.ipsetCacheMaxEntries`：ipset 本地缓存最大条目数（默认 200000，用于控制内存上限）
+- `limits.ipsetSyncMaxPerRound`：每轮 Redis→ipset 最大同步条目数（默认 50000，防止单轮同步过载）
+- `limits.blacklistIpKeyMaxLen`：blacklist key 中 IP 最大长度（默认 64，过滤异常 key）
 - `limits.machineHealthCheckSec`：机器健康检查间隔（秒，默认 2）
 - `limits.machineMaxCPUPercent`：CPU 使用率熔断阈值（%，默认 92）
 - `limits.machineMaxLoadPerCpu`：每核 Load 熔断阈值（默认 1.5）

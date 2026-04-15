@@ -324,7 +324,7 @@ func TestAllowRequestWithReason(t *testing.T) {
 	})
 }
 
-func TestSetBlacklistWithMaxTTL_LevelEscalationOnly(t *testing.T) {
+func TestSetBlacklistWithMaxTTL_LevelEscalationAndSameLevelExtension(t *testing.T) {
 	s := miniredis.RunT(t)
 	defer s.Close()
 
@@ -352,16 +352,16 @@ func TestSetBlacklistWithMaxTTL_LevelEscalationOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("同档位重复设置失败: %v", err)
 	}
-	if updated {
-		t.Fatalf("同档位不应更新 TTL")
+	if !updated {
+		t.Fatalf("同档位且更长 TTL 应更新")
 	}
 
 	ttlSameLevel, err := rdb.PTTL(ctx, key).Result()
 	if err != nil {
 		t.Fatalf("读取同档位 TTL 失败: %v", err)
 	}
-	if ttlSameLevel > 20*time.Second {
-		t.Fatalf("同档位 TTL 不应被回刷，当前=%s", ttlSameLevel)
+	if ttlSameLevel < 45*time.Second {
+		t.Fatalf("同档位更长 TTL 应被回刷，当前=%s", ttlSameLevel)
 	}
 
 	updated, err = setBlacklistWithMaxTTL(ctx, key, levelKey, 5*time.Minute, 2)
@@ -436,8 +436,8 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取同档位 TTL 失败: %v", err)
 	}
-	if ttlAfterSameLevel > 25*time.Second {
-		t.Fatalf("同档位不应回刷 TTL，当前=%s", ttlAfterSameLevel)
+	if ttlAfterSameLevel < 45*time.Second {
+		t.Fatalf("同档位应回刷为更长 TTL，当前=%s", ttlAfterSameLevel)
 	}
 
 	banIP(ctx, ip)
@@ -899,6 +899,21 @@ func TestBanIP_LocalFallbackWhenRedisUnavailable(t *testing.T) {
 	banIP(ctx, ip)
 	if !isBlacklisted(ctx, ip) {
 		t.Fatalf("Redis 不可用时第 3 次违规应触发本地兜底封禁")
+	}
+}
+
+func TestRedisSyncCursor_ProgressAcrossRounds(t *testing.T) {
+	originalCursor := getRedisSyncCursor()
+	defer setRedisSyncCursor(originalCursor)
+
+	setRedisSyncCursor(123)
+	if got := getRedisSyncCursor(); got != 123 {
+		t.Fatalf("getRedisSyncCursor()=%d, want=123", got)
+	}
+
+	setRedisSyncCursor(0)
+	if got := getRedisSyncCursor(); got != 0 {
+		t.Fatalf("cursor reset failed, got=%d", got)
 	}
 }
 

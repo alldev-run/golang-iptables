@@ -29,6 +29,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	defaultMaxIPSetCacheEntries = 200000
+	defaultMaxRedisSyncPerRound = 50000
+	defaultMaxBlacklistIPKeyLen = 64
+	redisSyncMinPTTL            = 200 * time.Millisecond
+)
+
 var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
@@ -54,6 +61,8 @@ var (
 	rateLimiterConfigMu sync.Mutex
 	logThrottleMu       sync.Mutex
 	logThrottleLastAt   = make(map[string]time.Time)
+	redisSyncCursorMu   sync.Mutex
+	redisSyncCursor     uint64
 
 	blacklistSetMaxTTLScript = redis.NewScript(`
 local ttl = redis.call("PTTL", KEYS[1])
@@ -68,6 +77,11 @@ local currentLevel = tonumber(redis.call("GET", KEYS[2]) or "0")
 if newLevel > currentLevel then
 	redis.call("PEXPIRE", KEYS[1], newTTL)
 	redis.call("SET", KEYS[2], newLevel, "PX", newTTL)
+	return 1
+end
+if newLevel == currentLevel and newTTL > ttl then
+	redis.call("PEXPIRE", KEYS[1], newTTL)
+	redis.call("PEXPIRE", KEYS[2], newTTL)
 	return 1
 end
 return 0
@@ -157,6 +171,9 @@ type LimitConfig struct {
 	MachineUnhealthyThreshold int   `json:"machineUnhealthyThreshold"` // 连续异常次数触发熔断
 	MachineRecoveryThreshold  int   `json:"machineRecoveryThreshold"`  // 连续恢复次数关闭熔断
 	IpsetSyncIntervalSec int `json:"ipsetSyncIntervalSec"` // ipset 从 Redis 同步间隔 (秒，0 表示不同步)
+	IpsetCacheMaxEntries int `json:"ipsetCacheMaxEntries"` // ipset 本地缓存最大条目数
+	IpsetSyncMaxPerRound int `json:"ipsetSyncMaxPerRound"` // 每轮 Redis->ipset 最大同步条目数
+	BlacklistIPKeyMaxLen int `json:"blacklistIpKeyMaxLen"` // blacklist key 中 IP 最大长度
 	AuthTimeoutSec      int `json:"authTimeoutSec"`      // 认证超时 (秒)
 	ShutdownTimeoutSec  int `json:"shutdownTimeoutSec"`  // 优雅关闭超时 (秒)
 }
@@ -229,11 +246,47 @@ func defaultConfig() Config {
 			MachineUnhealthyThreshold: 3,
 			MachineRecoveryThreshold:  3,
 			IpsetSyncIntervalSec: 30,
+			IpsetCacheMaxEntries: defaultMaxIPSetCacheEntries,
+			IpsetSyncMaxPerRound: defaultMaxRedisSyncPerRound,
+			BlacklistIPKeyMaxLen: defaultMaxBlacklistIPKeyLen,
 			AuthTimeoutSec:      3,
 			ShutdownTimeoutSec:  30,
 		},
 		EnableWebSocket: true,
 	}
+}
+
+func upsertIPSetCacheWithCap(ip string, expireAt time.Time) bool {
+	ipsetMutex.Lock()
+	defer ipsetMutex.Unlock()
+
+	if currentExpireAt, ok := ipsetCache[ip]; ok {
+		if !expireAt.After(currentExpireAt) {
+			return false
+		}
+		ipsetCache[ip] = expireAt
+		return true
+	}
+
+	if len(ipsetCache) >= cfg.Limits.IpsetCacheMaxEntries {
+		now := time.Now()
+		for cachedIP, cachedExpireAt := range ipsetCache {
+			if now.After(cachedExpireAt) {
+				delete(ipsetCache, cachedIP)
+			}
+		}
+	}
+
+	if len(ipsetCache) >= cfg.Limits.IpsetCacheMaxEntries {
+		for cachedIP := range ipsetCache {
+			delete(ipsetCache, cachedIP)
+			logThrottled("ipset_cache_evict", 5*time.Second, "ipsetCache 达到上限(%d)，触发淘汰保护", cfg.Limits.IpsetCacheMaxEntries)
+			break
+		}
+	}
+
+	ipsetCache[ip] = expireAt
+	return true
 }
 
 func normalizeConfig(c *Config) {
@@ -326,6 +379,15 @@ func normalizeConfig(c *Config) {
 	}
 	if c.Limits.MachineRecoveryThreshold <= 0 {
 		c.Limits.MachineRecoveryThreshold = 3
+	}
+	if c.Limits.IpsetCacheMaxEntries <= 0 {
+		c.Limits.IpsetCacheMaxEntries = defaultMaxIPSetCacheEntries
+	}
+	if c.Limits.IpsetSyncMaxPerRound <= 0 {
+		c.Limits.IpsetSyncMaxPerRound = defaultMaxRedisSyncPerRound
+	}
+	if c.Limits.BlacklistIPKeyMaxLen <= 0 {
+		c.Limits.BlacklistIPKeyMaxLen = defaultMaxBlacklistIPKeyLen
 	}
 	if c.Limits.AuthTimeoutSec <= 0 {
 		c.Limits.AuthTimeoutSec = 3
@@ -578,7 +640,7 @@ func isBlacklisted(ctx context.Context, ip string) bool {
 		return false
 	}
 
-	ttl, err := rdb.TTL(ctx, "blacklist:"+ip).Result()
+	ttl, err := rdb.PTTL(ctx, "blacklist:"+ip).Result()
 	if err != nil {
 		logThrottled("redis_is_blacklisted", 3*time.Second, "Redis error in isBlacklisted: %v", err)
 		blacklistCacheMu.Lock()
@@ -644,14 +706,9 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 	expireAt := time.Now().Add(banDuration)
 	ipLocal := ip
 
-	ipsetMutex.Lock()
-	currentExpireAt, ok := ipsetCache[ipLocal]
-	if ok && !expireAt.After(currentExpireAt) {
-		ipsetMutex.Unlock()
+	if !upsertIPSetCacheWithCap(ipLocal, expireAt) {
 		return
 	}
-	ipsetCache[ipLocal] = expireAt
-	ipsetMutex.Unlock()
 
 	cacheBlacklistLocal(ipLocal, banDuration)
 	enqueueIPSetBan(ipLocal, banDuration)
@@ -663,11 +720,17 @@ func syncIPSetFromRedis() {
 	}
 
 	ctx := context.Background()
-	var cursor uint64
+	cursor := getRedisSyncCursor()
 	pattern := "blacklist:*"
 	count := int64(100)
+	processed := 0
 
 	for {
+		if processed >= cfg.Limits.IpsetSyncMaxPerRound {
+			logThrottled("redis_sync_ipset_limit", 5*time.Second, "Redis->ipset 同步达到单轮上限，提前结束: processed=%d", processed)
+			break
+		}
+
 		keys, nextCursor, err := rdb.Scan(ctx, cursor, pattern, count).Result()
 		if err != nil {
 			log.Printf("Redis scan error in syncIPSetFromRedis: %v", err)
@@ -675,30 +738,44 @@ func syncIPSetFromRedis() {
 		}
 
 		for _, key := range keys {
-			ip := strings.TrimPrefix(key, "blacklist:")
-			ttl, err := rdb.TTL(ctx, key).Result()
-			if err != nil {
-				log.Printf("Redis TTL error for %s: %v", key, err)
+			if processed >= cfg.Limits.IpsetSyncMaxPerRound {
+				break
+			}
+
+			ipRaw := strings.TrimPrefix(key, "blacklist:")
+			if len(ipRaw) == 0 || len(ipRaw) > cfg.Limits.BlacklistIPKeyMaxLen {
+				logThrottled("redis_sync_invalid_ip_len", 5*time.Second, "Redis->ipset 忽略异常 blacklist key: %q", key)
 				continue
 			}
 
-			if ttl > 0 {
-				ipsetMutex.Lock()
-				currentExpireAt, ok := ipsetCache[ip]
+			parsedIP := net.ParseIP(ipRaw)
+			if parsedIP == nil {
+				continue
+			}
+			ip := parsedIP.String()
+
+			ttl, err := rdb.PTTL(ctx, key).Result()
+			if err != nil {
+				log.Printf("Redis PTTL error for %s: %v", key, err)
+				continue
+			}
+
+			if ttl >= redisSyncMinPTTL {
 				newExpireAt := time.Now().Add(ttl)
-				if !ok || newExpireAt.After(currentExpireAt) {
-					ipsetCache[ip] = newExpireAt
+				if upsertIPSetCacheWithCap(ip, newExpireAt) {
+					cacheBlacklistLocal(ip, ttl)
+					enqueueIPSetBan(ip, ttl)
 				}
-				ipsetMutex.Unlock()
-				cacheBlacklistLocal(ip, ttl)
-				enqueueIPSetBan(ip, ttl)
+				processed++
 			}
 		}
 
 		if nextCursor == 0 {
+			setRedisSyncCursor(0)
 			break
 		}
 		cursor = nextCursor
+		setRedisSyncCursor(cursor)
 	}
 }
 
@@ -827,8 +904,31 @@ func enqueueIPSetBan(ip string, banDuration time.Duration) {
 	select {
 	case ipsetQueue <- task:
 	default:
-		logThrottled("ipset_queue_drop", 2*time.Second, "ipset 队列拥堵，丢弃任务: ip=%s timeout=%d", ip, banSeconds)
+		if runIPSetAddFallback(task) {
+			logThrottled("ipset_queue_fallback", 2*time.Second, "ipset 队列拥堵，已走同步回退: ip=%s timeout=%d", ip, banSeconds)
+			return
+		}
+		logThrottled("ipset_queue_drop", 2*time.Second, "ipset 队列拥堵且回退不可用，丢弃任务: ip=%s timeout=%d", ip, banSeconds)
 	}
+}
+
+func runIPSetAddFallback(task ipsetBanTask) bool {
+	if task.banSeconds <= 0 {
+		return false
+	}
+
+	sem := ipsetSem
+	if sem != nil {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			return false
+		}
+	}
+
+	runIPSetAdd(task.ip, task.banSeconds)
+	return true
 }
 
 func runIPSetAdd(ip string, banSeconds int) {
@@ -2003,4 +2103,16 @@ func logThrottled(key string, interval time.Duration, format string, args ...any
 	logThrottleMu.Unlock()
 
 	log.Printf(format, args...)
+}
+
+func getRedisSyncCursor() uint64 {
+	redisSyncCursorMu.Lock()
+	defer redisSyncCursorMu.Unlock()
+	return redisSyncCursor
+}
+
+func setRedisSyncCursor(cursor uint64) {
+	redisSyncCursorMu.Lock()
+	redisSyncCursor = cursor
+	redisSyncCursorMu.Unlock()
 }
