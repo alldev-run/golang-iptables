@@ -34,6 +34,7 @@ const (
 	defaultMaxRedisSyncPerRound = 50000
 	defaultMaxBlacklistIPKeyLen = 64
 	redisSyncMinPTTL            = 200 * time.Millisecond
+	maxCumulativeBanDuration    = 30 * 24 * time.Hour
 )
 
 var (
@@ -651,6 +652,7 @@ func isBlacklisted(ctx context.Context, ip string) bool {
 
 	if ttl > 0 {
 		blacklistCacheMu.Lock()
+		enforceBlacklistHitCacheCapLocked(ip)
 		blacklistHitCache[ip] = now.Add(ttl)
 		delete(blacklistMissCache, ip)
 		blacklistCacheMu.Unlock()
@@ -958,9 +960,10 @@ func banIP(ctx context.Context, ip string) {
 		logThrottled("redis_ban_strike_expire", 3*time.Second, "Redis error in banIP strike expire: %v", err)
 	}
 
-	banDuration := banDurationByStrikes(strikes)
+	banIncrement := banDurationByStrikes(strikes)
+	banDuration := calculateCumulativeBanDuration(ctx, ip, banIncrement)
 	banLevel := banLevelByStrikes(strikes)
-	if banDuration == 0 {
+	if banIncrement == 0 {
 		log.Printf("IP %s 触发限流，累计违规次数=%d，未封禁（渐进式策略）", ip, strikes)
 		return
 	}
@@ -1925,6 +1928,7 @@ func cacheBlacklistLocal(ip string, banDuration time.Duration) {
 	}
 
 	blacklistCacheMu.Lock()
+	enforceBlacklistHitCacheCapLocked(ip)
 	blacklistHitCache[ip] = time.Now().Add(banDuration)
 	delete(blacklistMissCache, ip)
 	blacklistCacheMu.Unlock()
@@ -1946,15 +1950,97 @@ func incrementLocalStrike(ip string, now time.Time) int64 {
 
 func applyLocalFallbackBan(ip string, reason string) {
 	strikes := incrementLocalStrike(ip, time.Now())
-	banDuration := banDurationByStrikes(strikes)
-	if banDuration <= 0 {
+	banIncrement := banDurationByStrikes(strikes)
+	if banIncrement <= 0 {
 		logThrottled("local_fallback_no_ban", 3*time.Second, "本地兜底记录违规但未封禁: ip=%s, strikes=%d, reason=%s", ip, strikes, reason)
 		return
 	}
+	banDuration := calculateCumulativeLocalBanDuration(ip, banIncrement)
 
 	cacheBlacklistLocal(ip, banDuration)
 	syncIPSetBan(ip, banDuration)
 	log.Printf("本地兜底封禁生效: ip=%s, strikes=%d, duration=%s, reason=%s", ip, strikes, banDuration, reason)
+}
+
+func calculateCumulativeBanDuration(ctx context.Context, ip string, increment time.Duration) time.Duration {
+	if increment <= 0 {
+		return 0
+	}
+
+	current := currentRedisBanDuration(ctx, ip)
+	total := current + increment
+	if total > maxCumulativeBanDuration {
+		return maxCumulativeBanDuration
+	}
+	return total
+}
+
+func currentRedisBanDuration(ctx context.Context, ip string) time.Duration {
+	if rdb == nil {
+		return 0
+	}
+
+	ttl, err := rdb.PTTL(ctx, "blacklist:"+ip).Result()
+	if err != nil || ttl <= 0 {
+		return 0
+	}
+	if ttl > maxCumulativeBanDuration {
+		return maxCumulativeBanDuration
+	}
+	return ttl
+}
+
+func calculateCumulativeLocalBanDuration(ip string, increment time.Duration) time.Duration {
+	if increment <= 0 {
+		return 0
+	}
+
+	now := time.Now()
+	var current time.Duration
+
+	blacklistCacheMu.RLock()
+	if expireAt, ok := blacklistHitCache[ip]; ok && expireAt.After(now) {
+		current = expireAt.Sub(now)
+	}
+	blacklistCacheMu.RUnlock()
+
+	total := current + increment
+	if total > maxCumulativeBanDuration {
+		return maxCumulativeBanDuration
+	}
+	return total
+}
+
+func enforceBlacklistHitCacheCapLocked(ip string) {
+	if _, exists := blacklistHitCache[ip]; exists {
+		return
+	}
+
+	maxEntries := cfg.Limits.IpsetCacheMaxEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultMaxIPSetCacheEntries
+	}
+
+	if len(blacklistHitCache) < maxEntries {
+		return
+	}
+
+	now := time.Now()
+	for cachedIP, expireAt := range blacklistHitCache {
+		if !expireAt.After(now) {
+			delete(blacklistHitCache, cachedIP)
+		}
+	}
+
+	if len(blacklistHitCache) < maxEntries {
+		return
+	}
+
+	for cachedIP := range blacklistHitCache {
+		delete(blacklistHitCache, cachedIP)
+		logThrottled("blacklist_hit_cache_evict", 5*time.Second, "blacklistHitCache 达到上限(%d)，触发淘汰保护", maxEntries)
+		break
+	}
 }
 
 func ensureRateLimiterConfig() {

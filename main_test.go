@@ -442,6 +442,13 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 
 	banIP(ctx, ip)
 	banIP(ctx, ip)
+	ttlAfterTwoLevel1, err := rdb.PTTL(ctx, blacklistKey).Result()
+	if err != nil {
+		t.Fatalf("读取两次1级后 TTL 失败: %v", err)
+	}
+	if ttlAfterTwoLevel1 < 100*time.Second {
+		t.Fatalf("两次1级封禁后 TTL 应累计到约2分钟，当前=%s", ttlAfterTwoLevel1)
+	}
 
 	levelVal, err = rdb.Get(ctx, levelKey).Result()
 	if err != nil {
@@ -457,6 +464,9 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 	}
 	if ttlLevel2 < 4*time.Minute {
 		t.Fatalf("2 级封禁 TTL 应接近 5 分钟，当前=%s", ttlLevel2)
+	}
+	if ttlLevel2 < ttlAfterTwoLevel1 {
+		t.Fatalf("累计策略下 2 级后 TTL 不应小于之前累计值，before=%s after=%s", ttlAfterTwoLevel1, ttlLevel2)
 	}
 
 	for i := 0; i < 4; i++ {
@@ -477,6 +487,9 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 	}
 	if ttlLevel3 < 9*time.Minute {
 		t.Fatalf("3 级封禁 TTL 应接近 10 分钟，当前=%s", ttlLevel3)
+	}
+	if ttlLevel3 < ttlLevel2 {
+		t.Fatalf("累计策略下 3 级后 TTL 不应小于 2 级，level2=%s level3=%s", ttlLevel2, ttlLevel3)
 	}
 }
 
@@ -914,6 +927,29 @@ func TestRedisSyncCursor_ProgressAcrossRounds(t *testing.T) {
 	setRedisSyncCursor(0)
 	if got := getRedisSyncCursor(); got != 0 {
 		t.Fatalf("cursor reset failed, got=%d", got)
+	}
+}
+
+func TestCalculateCumulativeBanDuration_CappedAt30Days(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+
+	originalRDB := rdb
+	defer func() {
+		rdb = originalRDB
+	}()
+
+	rdb = redis.NewClient(&redis.Options{Addr: s.Addr()})
+	ctx := context.Background()
+	ip := "198.51.100.11"
+
+	if err := rdb.Set(ctx, "blacklist:"+ip, "1", 29*24*time.Hour).Err(); err != nil {
+		t.Fatalf("预置 blacklist TTL 失败: %v", err)
+	}
+
+	total := calculateCumulativeBanDuration(ctx, ip, 5*24*time.Hour)
+	if total != maxCumulativeBanDuration {
+		t.Fatalf("累计封禁应封顶30天，got=%s want=%s", total, maxCumulativeBanDuration)
 	}
 }
 
