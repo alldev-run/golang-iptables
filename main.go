@@ -830,6 +830,26 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 	enqueueIPSetBan(ipLocal, banDuration)
 }
 
+func syncIPSetUnban(ip string) {
+	parsedIP := net.ParseIP(strings.TrimSpace(ip))
+	if parsedIP == nil {
+		return
+	}
+	ipLocal := parsedIP.String()
+
+	ipsetMutex.Lock()
+	delete(ipsetCache, ipLocal)
+	ipsetMutex.Unlock()
+
+	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
+	defer cmdCancel()
+
+	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "del", "blacklist", ipLocal)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		logThrottled("ipset_del_error", 2*time.Second, "ipset del error: %v, output=%s", err, strings.TrimSpace(string(output)))
+	}
+}
+
 func localBanPersistEnabled() bool {
 	if !cfg.Limits.LocalBanPersistEnabled {
 		return false
@@ -1440,6 +1460,30 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ipStr := parsedIP.String()
+	if req.Duration == 0 {
+		if rdb == nil {
+			logThrottled("admin_unban_redis_nil", 3*time.Second, "Redis client not initialized in admin unban")
+		} else {
+			ctx := context.Background()
+			if err := rdb.Del(ctx, "blacklist:"+ipStr, "blacklist_level:"+ipStr).Err(); err != nil {
+				logThrottled("admin_unban_redis_error", 3*time.Second, "Redis error in admin unban: %v", err)
+			}
+		}
+
+		removeBlacklistLocal(ipStr)
+		syncIPSetUnban(ipStr)
+		log.Printf("Admin manual unban: ip=%s", ipStr)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":   "success",
+			"ip":       ipStr,
+			"duration": "0s",
+			"action":   "unban",
+		})
+		return
+	}
+
 	duration := 10 * time.Minute
 	if req.Duration > 0 {
 		duration = time.Duration(req.Duration) * time.Second
@@ -2256,6 +2300,22 @@ func cacheBlacklistLocalUntil(ip string, expireAt time.Time, persist bool) {
 	if persist {
 		markLocalBanPersistDirty()
 	}
+}
+
+func removeBlacklistLocal(ip string) {
+	ip = strings.TrimSpace(ip)
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return
+	}
+	ip = parsedIP.String()
+
+	blacklistCacheMu.Lock()
+	delete(blacklistHitCache, ip)
+	delete(blacklistMissCache, ip)
+	blacklistCacheMu.Unlock()
+
+	markLocalBanPersistDirty()
 }
 
 func incrementLocalStrike(ip string, now time.Time) int64 {
