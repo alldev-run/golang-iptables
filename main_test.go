@@ -1116,3 +1116,75 @@ func diffPaths(left map[string]struct{}, right map[string]struct{}) []string {
 	}
 	return missing
 }
+
+func TestBuildBackendWebSocketURL_PreservePathAndQuery(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example.com/ws/chat?room=alpha&lang=zh", nil)
+
+	got, err := buildBackendWebSocketURL("127.0.0.1:9502", req)
+	if err != nil {
+		t.Fatalf("buildBackendWebSocketURL() error = %v", err)
+	}
+
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse(%q) error = %v", got, err)
+	}
+	if parsed.Scheme != "ws" {
+		t.Fatalf("scheme = %q, want ws", parsed.Scheme)
+	}
+	if parsed.Host != "127.0.0.1:9502" {
+		t.Fatalf("host = %q, want 127.0.0.1:9502", parsed.Host)
+	}
+	if parsed.Path != "/ws/chat" {
+		t.Fatalf("path = %q, want /ws/chat", parsed.Path)
+	}
+	if parsed.RawQuery != "room=alpha&lang=zh" {
+		t.Fatalf("query = %q, want room=alpha&lang=zh", parsed.RawQuery)
+	}
+}
+
+func TestBuildBackendWebSocketURL_WithBasePathAndTargetQuery(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example.com/stream?b=2", nil)
+
+	got, err := buildBackendWebSocketURL("ws://backend.internal/base?a=1", req)
+	if err != nil {
+		t.Fatalf("buildBackendWebSocketURL() error = %v", err)
+	}
+
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse(%q) error = %v", got, err)
+	}
+	if parsed.Host != "backend.internal" {
+		t.Fatalf("host = %q, want backend.internal", parsed.Host)
+	}
+	if parsed.Path != "/base/stream" {
+		t.Fatalf("path = %q, want /base/stream", parsed.Path)
+	}
+	if parsed.RawQuery != "a=1&b=2" {
+		t.Fatalf("query = %q, want a=1&b=2", parsed.RawQuery)
+	}
+}
+
+func TestBuildBackendWSDialHeader_ForwardKeyHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example.com/ws?room=42", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set("Sec-WebSocket-Protocol", "chat.v1")
+	req.Header.Set("Cookie", "sid=abc")
+	req.Header.Set("X-Request-Id", "req-1")
+
+	headers := buildBackendWSDialHeader(req, "203.0.113.10")
+
+	if headers.Get("Authorization") != "Bearer token" {
+		t.Fatalf("Authorization header not forwarded")
+	}
+	if headers.Get("Sec-WebSocket-Protocol") != "chat.v1" {
+		t.Fatalf("Sec-WebSocket-Protocol header not forwarded")
+	}
+	if headers.Get("X-Forwarded-For") != "203.0.113.10" {
+		t.Fatalf("X-Forwarded-For = %q, want 203.0.113.10", headers.Get("X-Forwarded-For"))
+	}
+	if headers.Get("X-Forwarded-Uri") != "/ws?room=42" {
+		t.Fatalf("X-Forwarded-Uri = %q, want /ws?room=42", headers.Get("X-Forwarded-Uri"))
+	}
+}

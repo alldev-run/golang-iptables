@@ -1588,6 +1588,105 @@ func isDialFailure(err error) bool {
 	return strings.Contains(errText, "dial tcp") || strings.Contains(errText, "connection refused")
 }
 
+func buildBackendWebSocketURL(target string, r *http.Request) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("backend is empty")
+	}
+
+	if !strings.HasPrefix(target, "ws://") && !strings.HasPrefix(target, "wss://") {
+		target = "ws://" + target
+	}
+
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return "", fmt.Errorf("invalid backend websocket url: %w", err)
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("invalid backend websocket host")
+	}
+
+	reqPath := "/"
+	if r != nil && r.URL != nil {
+		if p := strings.TrimSpace(r.URL.Path); p != "" {
+			reqPath = p
+		}
+		parsed.Path = joinBackendWSPath(parsed.Path, reqPath)
+		if rawQuery := strings.TrimSpace(r.URL.RawQuery); rawQuery != "" {
+			if parsed.RawQuery == "" {
+				parsed.RawQuery = rawQuery
+			} else {
+				parsed.RawQuery = parsed.RawQuery + "&" + rawQuery
+			}
+		}
+	}
+
+	return parsed.String(), nil
+}
+
+func joinBackendWSPath(basePath, reqPath string) string {
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	if !strings.HasPrefix(reqPath, "/") {
+		reqPath = "/" + reqPath
+	}
+
+	if basePath == "" || basePath == "/" {
+		return reqPath
+	}
+	if !strings.HasPrefix(basePath, "/") {
+		basePath = "/" + basePath
+	}
+	basePath = strings.TrimSuffix(basePath, "/")
+	if reqPath == "/" {
+		return basePath
+	}
+	return basePath + reqPath
+}
+
+func buildBackendWSDialHeader(r *http.Request, clientIP string) http.Header {
+	headers := make(http.Header)
+	if r == nil {
+		return headers
+	}
+
+	copyHeaders := []string{
+		"Authorization",
+		"Cookie",
+		"Origin",
+		"Sec-WebSocket-Protocol",
+		"User-Agent",
+		"X-Request-Id",
+		"X-Trace-Id",
+	}
+	for _, headerName := range copyHeaders {
+		if values := r.Header.Values(headerName); len(values) > 0 {
+			for _, value := range values {
+				headers.Add(headerName, value)
+			}
+		}
+	}
+
+	if clientIP != "" {
+		headers.Set("X-Real-IP", clientIP)
+		headers.Set("X-Forwarded-For", clientIP)
+	}
+	if r.Host != "" {
+		headers.Set("X-Forwarded-Host", r.Host)
+	}
+	if r.URL != nil {
+		headers.Set("X-Forwarded-Uri", r.URL.RequestURI())
+	}
+	if r.TLS != nil {
+		headers.Set("X-Forwarded-Proto", "https")
+	} else {
+		headers.Set("X-Forwarded-Proto", "http")
+	}
+
+	return headers
+}
+
 func readCPUSnapshot() (cpuSnapshot, error) {
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
@@ -1949,6 +2048,13 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 使用单一后端
 	target := cfg.Backend
+	backendWSURL, err := buildBackendWebSocketURL(target, r)
+	if err != nil {
+		log.Println("WebSocket 后端地址无效:", err)
+		_ = clientWS.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "invalid backend websocket"))
+		return
+	}
+	dialHeaders := buildBackendWSDialHeader(r, ip)
 	var targetConn *websocket.Conn
 	var dialErr error
 
@@ -1970,7 +2076,7 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		targetConn, _, dialErr = websocket.DefaultDialer.Dial("ws://"+target, nil)
+		targetConn, _, dialErr = websocket.DefaultDialer.Dial(backendWSURL, dialHeaders)
 		if dialErr == nil {
 			break
 		}
@@ -1978,7 +2084,7 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if dialErr != nil {
-		log.Println("WebSocket 后端连接最终失败:", target, dialErr)
+		log.Println("WebSocket 后端连接最终失败:", backendWSURL, dialErr)
 		_ = clientWS.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "backend connection error"))
 		return
 	}
