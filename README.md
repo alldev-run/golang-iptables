@@ -44,12 +44,14 @@ go mod download
     "maxConn": 5
   },
   "auth": {
-    "token": "123456"
+    "token": "123456",
+    "adminToken": ""
   },
   "trustedProxies": [
     "127.0.0.1/8",
     "::1/128"
   ],
+  "enableWebSocket": true,
   "limits": {
     "maxConnections": 2000,
     "maxBodySizeMB": 2,
@@ -79,7 +81,9 @@ go mod download
 - `rateLimit.globalMaxRequests`：全局限流窗口内最大请求数（默认 5000）
 - `rateLimit.windowSec`：限流窗口时间（秒，默认 10）
 - `rateLimit.maxConn`：单个 IP 最大并发连接数（默认 5）
-- `auth.token`：WebSocket Upgrade 前 Header 鉴权 token
+- `auth.token`：WebSocket Upgrade 前 Header 鉴权 token（已废弃，使用 enableWebSocket 控制）
+- `auth.adminToken`：内部管理接口认证 token（用于手动封禁 IP）
+- `enableWebSocket`：是否启用 WebSocket 转发（默认 true，设为 false 则禁用 WebSocket）
 - `trustedProxies`：可信代理来源列表（支持 IP/CIDR），仅来自这些地址时才信任 `X-Forwarded-For`
 - `limits.maxConnections`：全局最大连接数（默认 5000）
 - `limits.maxBodySizeMB`：HTTP 请求体最大大小（MB，默认 10）
@@ -121,23 +125,18 @@ go test -v
 **接入流程：**
 
 1. 客户端连接到网关 WebSocket 端口
-2. 网关在 `Upgrade` 前先执行黑名单检查、限流、连接数限制
-3. 网关在 `Upgrade` 前校验鉴权 Header（`Authorization` 或 `X-Auth-Token`）
+2. 网关检查 `enableWebSocket` 配置，若为 false 则拒绝连接
+3. 网关在 `Upgrade` 前先执行黑名单检查、限流、连接数限制
 4. 通过后才升级 WebSocket，并与后端建立连接双向转发
 5. 网关每 30 秒发送 Ping，连接读超时约 65 秒，达到最大生命周期后会主动断开
 
 **客户端代码示例：**
 
 ```javascript
-// Node.js 示例（ws 库），可设置 Header
+// Node.js 示例（ws 库）
 import WebSocket from 'ws';
 
-const ws = new WebSocket('ws://localhost:8080', {
-  headers: {
-    Authorization: 'Bearer 123456',
-    // 或者: 'X-Auth-Token': '123456'
-  },
-});
+const ws = new WebSocket('ws://localhost:8080');
 
 // 接收消息
 ws.onmessage = (event) => {
@@ -150,12 +149,10 @@ ws.onopen = () => {
 };
 ```
 
-**鉴权说明：**
-- Header 鉴权，支持：
-  - `Authorization: Bearer <token>`
-  - `X-Auth-Token: <token>`
-- 鉴权在 `Upgrade` 前执行，失败返回 `401 Unauthorized`
-- 浏览器原生 WebSocket 无法自定义 Header，浏览器接入需通过反向代理注入 Header 或改造鉴权方式
+**配置说明：**
+- 通过配置文件中的 `enableWebSocket` 字段控制是否启用 WebSocket 转发（默认 true）
+- 设为 `false` 时，所有 WebSocket 连接请求将被拒绝
+- 不再需要 Header 鉴权，可直接连接
 
 **心跳说明：**
 - 网关每 30 秒发送一次 Ping
@@ -218,6 +215,51 @@ fetch('http://localhost:8080/api/test')
 ### 热重载
 
 修改 `config.json` 配置文件后，服务会自动重新加载配置，无需重启。
+
+### 内部黑名单管理接口
+
+网关提供内部管理接口，允许内部程序手动添加 IP 到黑名单。
+
+**接口地址：** `POST /admin/ban`
+
+**认证方式：**
+- Header 中携带 admin token：
+  - `Authorization: Bearer <adminToken>`
+  - 或 `X-Admin-Token: <adminToken>`
+
+**请求参数（JSON）：**
+```json
+{
+  "ip": "1.2.3.4",
+  "duration": 600,
+  "reason": "manual ban"
+}
+```
+- `ip`：必填，要封禁的 IP 地址
+- `duration`：可选，封禁时长（秒），默认 600 秒（10 分钟）
+- `reason`：可选，封禁原因
+
+**响应示例（成功）：**
+```json
+{
+  "status": "success",
+  "ip": "1.2.3.4",
+  "duration": "10m0s"
+}
+```
+
+**使用示例：**
+```bash
+curl -X POST http://localhost:8080/admin/ban \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"ip": "1.2.3.4", "duration": 3600, "reason": "abuse"}'
+```
+
+**安全提示：**
+- admin token 仅用于内部管理接口，请妥善保管
+- 建议通过内网或防火墙限制访问 `/admin/ban` 接口
+- 生产环境请修改默认的 admin token
 
 ## ipset 配置
 

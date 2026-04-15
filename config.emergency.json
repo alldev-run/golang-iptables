@@ -12,12 +12,14 @@
     "maxConn": 1
   },
   "auth": {
-    "token": "CHANGE_ME_STRONG_TOKEN"
+    "token": "CHANGE_ME_STRONG_TOKEN",
+    "adminToken": "CHANGE_ME_ADMIN_TOKEN"
   },
   "trustedProxies": [
     "127.0.0.1/8",
     "::1/128"
   ],
+  "enableWebSocket": true,
   "limits": {
     "maxConnections": 800,
     "maxBodySizeMB": 2,

@@ -12,23 +12,25 @@
     "maxConn": 2
   },
   "auth": {
-    "token": "CHANGE_ME_STRONG_TOKEN"
+    "token": "CHANGE_ME_STRONG_TOKEN",
+    "adminToken": "CHANGE_ME_ADMIN_TOKEN"
   },
   "trustedProxies": [
     "127.0.0.1/8",
     "::1/128"
   ],
+  "enableWebSocket": true,
   "limits": {
     "maxConnections": 2000,
     "maxBodySizeMB": 2,
     "webSocketBufferSize": 262144,
-    "webSocketMaxLifetimeSec": 1800,
+    "webSocketMaxLifetimeSec": 7200,
     "ipsetConcurrency": 20,
     "ipsetTimeoutSec": 3,
     "machineHealthCheckSec": 2,
-    "machineMaxCPUPercent": 92,
-    "machineMaxLoadPerCpu": 1.5,
-    "machineMaxMemoryPercent": 95,
+    "machineMaxCPUPercent": 100,
+    "machineMaxLoadPerCpu": 2,
+    "machineMaxMemoryPercent": 100,
     "machineUnhealthyThreshold": 3,
     "machineRecoveryThreshold": 3,
     "authTimeoutSec": 3,

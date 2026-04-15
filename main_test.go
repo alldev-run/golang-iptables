@@ -675,6 +675,93 @@ func TestHeartbeat(t *testing.T) {
 	}
 }
 
+func TestAdminBanHandler(t *testing.T) {
+	originalCfg := cfg
+	defer func() {
+		cfg = originalCfg
+	}()
+
+	cfg = defaultConfig()
+	cfg.Auth.AdminToken = "test-admin-token"
+
+	tests := []struct {
+		name           string
+		method         string
+		authHeader     string
+		body           string
+		expectedStatus int
+	}{
+		{
+			name:           "无认证",
+			method:         "POST",
+			authHeader:     "",
+			body:           `{"ip": "1.2.3.4"}`,
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "错误的认证token",
+			method:         "POST",
+			authHeader:     "Bearer wrong-token",
+			body:           `{"ip": "1.2.3.4"}`,
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "正确的认证token",
+			method:         "POST",
+			authHeader:     "Bearer test-admin-token",
+			body:           `{"ip": "1.2.3.4"}`,
+			expectedStatus: http.StatusInternalServerError,
+		},
+		{
+			name:           "X-Admin-Token认证",
+			method:         "POST",
+			authHeader:     "test-admin-token",
+			body:           `{"ip": "1.2.3.4"}`,
+			expectedStatus: http.StatusInternalServerError,
+		},
+		{
+			name:           "缺少IP",
+			method:         "POST",
+			authHeader:     "Bearer test-admin-token",
+			body:           `{}`,
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "无效的IP",
+			method:         "POST",
+			authHeader:     "Bearer test-admin-token",
+			body:           `{"ip": "invalid-ip"}`,
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "错误的HTTP方法",
+			method:         "GET",
+			authHeader:     "Bearer test-admin-token",
+			body:           `{"ip": "1.2.3.4"}`,
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "/admin/ban", strings.NewReader(tt.body))
+			if tt.authHeader != "" {
+				if strings.HasPrefix(strings.ToLower(tt.authHeader), "bearer ") {
+					req.Header.Set("Authorization", tt.authHeader)
+				} else {
+					req.Header.Set("X-Admin-Token", tt.authHeader)
+				}
+			}
+			w := httptest.NewRecorder()
+			adminBanHandler(w, req)
+
+			if w.Code != tt.expectedStatus {
+				t.Errorf("expected status %d, got %d", tt.expectedStatus, w.Code)
+			}
+		})
+	}
+}
+
 // 基准测试：getClientIP
 func BenchmarkGetClientIP(b *testing.B) {
 	req := httptest.NewRequest("GET", "/", nil)

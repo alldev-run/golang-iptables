@@ -139,6 +139,7 @@ type Config struct {
 	Auth           AuthConfig      `json:"auth"`
 	TrustedProxies []string        `json:"trustedProxies"`
 	Limits         LimitConfig     `json:"limits"`
+	EnableWebSocket bool           `json:"enableWebSocket"`
 }
 
 type RedisConfig struct {
@@ -155,7 +156,8 @@ type RateLimitConfig struct {
 }
 
 type AuthConfig struct {
-	Token string `json:"token"`
+	Token      string `json:"token"`
+	AdminToken string `json:"adminToken"`
 }
 
 type LimitConfig struct {
@@ -195,7 +197,8 @@ func defaultConfig() Config {
 			MaxConn:           5,
 		},
 		Auth: AuthConfig{
-			Token: "123456",
+			Token:      "123456",
+			AdminToken: "",
 		},
 		TrustedProxies: []string{"127.0.0.1/8", "::1/128"},
 		Limits: LimitConfig{
@@ -214,6 +217,7 @@ func defaultConfig() Config {
 			AuthTimeoutSec:      3,
 			ShutdownTimeoutSec:  30,
 		},
+		EnableWebSocket: true,
 	}
 }
 
@@ -496,6 +500,9 @@ func getClientIP(r *http.Request) string {
 
 // ---------------- 检测是否为WebSocket请求 ----------------
 func isWebSocket(r *http.Request) bool {
+	if !cfg.EnableWebSocket {
+		return false
+	}
 	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
@@ -727,6 +734,88 @@ func auth(r *http.Request) bool {
 		token = strings.TrimSpace(r.Header.Get("X-Auth-Token"))
 	}
 	return token != "" && token == cfg.Auth.Token
+}
+
+func adminAuth(r *http.Request) bool {
+	token := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		token = strings.TrimSpace(token[7:])
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	}
+	return token != "" && token == cfg.Auth.AdminToken
+}
+
+// ---------------- 内部管理接口 ----------------
+func adminBanHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !adminAuth(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		IP       string `json:"ip"`
+		Duration int    `json:"duration"` // seconds
+		Reason   string `json:"reason"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.IP == "" {
+		http.Error(w, "IP is required", http.StatusBadRequest)
+		return
+	}
+
+	parsedIP := net.ParseIP(req.IP)
+	if parsedIP == nil {
+		http.Error(w, "Invalid IP address", http.StatusBadRequest)
+		return
+	}
+
+	ipStr := parsedIP.String()
+	duration := 10 * time.Minute
+	if req.Duration > 0 {
+		duration = time.Duration(req.Duration) * time.Second
+	}
+
+	if rdb == nil {
+		log.Printf("Redis client not initialized in admin ban")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	ctx := context.Background()
+	blacklistKey := "blacklist:" + ipStr
+	levelKey := "blacklist_level:" + ipStr
+	if _, err := setBlacklistWithMaxTTL(ctx, blacklistKey, levelKey, duration, 3); err != nil {
+		log.Printf("Redis error in admin ban: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	syncIPSetBan(ipStr, duration)
+
+	reason := req.Reason
+	if reason == "" {
+		reason = "manual ban"
+	}
+	log.Printf("Admin manual ban: ip=%s, duration=%v, reason=%s", ipStr, duration, reason)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"ip":      ipStr,
+		"duration": duration.String(),
+	})
 }
 
 // ---------------- 心跳 ----------------
@@ -1111,12 +1200,6 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Header 鉴权，Upgrade 前完成
-	if !auth(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	// Upgrade 前连接数限制
 	allowed, err := incConn(ctx, ip)
 	if err != nil {
@@ -1387,6 +1470,7 @@ func main() {
 	go startMachineHealthCircuitBreaker()
 
 	http.HandleFunc("/", proxyHandler)
+	http.HandleFunc("/admin/ban", adminBanHandler)
 
 	srv := &http.Server{
 		Addr:         ":" + port,
