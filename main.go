@@ -34,6 +34,15 @@ const (
 	defaultMaxRedisSyncPerRound = 50000
 	defaultMaxBlacklistIPKeyLen = 64
 	redisSyncMinPTTL            = 200 * time.Millisecond
+	defaultRedisOpTimeoutMs        = 500
+	defaultRedisFastFailWindowMs   = 2000
+	defaultRedisDialTimeoutMs      = 500
+	defaultRedisReadTimeoutMs      = 500
+	defaultRedisWriteTimeoutMs     = 500
+	defaultRedisPoolTimeoutMs      = 500
+	defaultRedisPoolSize           = 128
+	defaultRedisMinIdleConns       = 16
+	defaultRedisMaxRetries         = -1
 	maxCumulativeBanDuration    = 30 * 24 * time.Hour
 	defaultLocalBanPersistWindowSec = 1800
 	defaultLocalBanPersistFlushMs   = 3000
@@ -68,6 +77,7 @@ var (
 	logThrottleLastAt   = make(map[string]time.Time)
 	redisSyncCursorMu   sync.Mutex
 	redisSyncCursor     uint64
+	redisFastFailUntil  atomic.Int64
 
 	blacklistSetMaxTTLScript = redis.NewScript(`
 local ttl = redis.call("PTTL", KEYS[1])
@@ -151,9 +161,18 @@ type Config struct {
 }
 
 type RedisConfig struct {
-	Addr     string `json:"addr"`
-	DB       int    `json:"db"`
-	Password string `json:"password"`
+	Addr             string `json:"addr"`
+	DB               int    `json:"db"`
+	Password         string `json:"password"`
+	OpTimeoutMs      int    `json:"opTimeoutMs"`
+	FastFailWindowMs int    `json:"fastFailWindowMs"`
+	DialTimeoutMs    int    `json:"dialTimeoutMs"`
+	ReadTimeoutMs    int    `json:"readTimeoutMs"`
+	WriteTimeoutMs   int    `json:"writeTimeoutMs"`
+	PoolTimeoutMs    int    `json:"poolTimeoutMs"`
+	PoolSize         int    `json:"poolSize"`
+	MinIdleConns     int    `json:"minIdleConns"`
+	MaxRetries       int    `json:"maxRetries"`
 }
 
 type RateLimitConfig struct {
@@ -242,9 +261,18 @@ func defaultConfig() Config {
 	return Config{
 		Backend: "127.0.0.1:9502",
 		Redis: RedisConfig{
-			Addr:     "127.0.0.1:6379",
-			DB:       14,
-			Password: "",
+			Addr:             "127.0.0.1:6379",
+			DB:               14,
+			Password:         "",
+			OpTimeoutMs:      defaultRedisOpTimeoutMs,
+			FastFailWindowMs: defaultRedisFastFailWindowMs,
+			DialTimeoutMs:    defaultRedisDialTimeoutMs,
+			ReadTimeoutMs:    defaultRedisReadTimeoutMs,
+			WriteTimeoutMs:   defaultRedisWriteTimeoutMs,
+			PoolTimeoutMs:    defaultRedisPoolTimeoutMs,
+			PoolSize:         defaultRedisPoolSize,
+			MinIdleConns:     defaultRedisMinIdleConns,
+			MaxRetries:       defaultRedisMaxRetries,
 		},
 		Cluster: ClusterConfig{
 			Enable:         false,
@@ -338,6 +366,36 @@ func normalizeConfig(c *Config) {
 	c.Backend = strings.TrimSpace(c.Backend)
 	if c.Backend == "" {
 		c.Backend = "127.0.0.1:9502"
+	}
+	if strings.TrimSpace(c.Redis.Addr) == "" {
+		c.Redis.Addr = "127.0.0.1:6379"
+	}
+	if c.Redis.OpTimeoutMs <= 0 {
+		c.Redis.OpTimeoutMs = defaultRedisOpTimeoutMs
+	}
+	if c.Redis.FastFailWindowMs <= 0 {
+		c.Redis.FastFailWindowMs = defaultRedisFastFailWindowMs
+	}
+	if c.Redis.DialTimeoutMs <= 0 {
+		c.Redis.DialTimeoutMs = defaultRedisDialTimeoutMs
+	}
+	if c.Redis.ReadTimeoutMs <= 0 {
+		c.Redis.ReadTimeoutMs = defaultRedisReadTimeoutMs
+	}
+	if c.Redis.WriteTimeoutMs <= 0 {
+		c.Redis.WriteTimeoutMs = defaultRedisWriteTimeoutMs
+	}
+	if c.Redis.PoolTimeoutMs <= 0 {
+		c.Redis.PoolTimeoutMs = defaultRedisPoolTimeoutMs
+	}
+	if c.Redis.PoolSize <= 0 {
+		c.Redis.PoolSize = defaultRedisPoolSize
+	}
+	if c.Redis.MinIdleConns <= 0 {
+		c.Redis.MinIdleConns = defaultRedisMinIdleConns
+	}
+	if c.Redis.MaxRetries == 0 {
+		c.Redis.MaxRetries = defaultRedisMaxRetries
 	}
 
 	filteredTrustedProxies := make([]string, 0, len(c.TrustedProxies))
@@ -615,12 +673,59 @@ func applyConfig(newCfg Config) error {
 }
 
 // ---------------- Redis初始化 ----------------
-func initRedis(addr string, db int, password string) {
+func initRedis(redisCfg RedisConfig) {
 	rdb = redis.NewClient(&redis.Options{
-		Addr:     addr,
-		DB:       db,
-		Password: password,
+		Addr:         redisCfg.Addr,
+		DB:           redisCfg.DB,
+		Password:     redisCfg.Password,
+		DialTimeout:  time.Duration(redisCfg.DialTimeoutMs) * time.Millisecond,
+		ReadTimeout:  time.Duration(redisCfg.ReadTimeoutMs) * time.Millisecond,
+		WriteTimeout: time.Duration(redisCfg.WriteTimeoutMs) * time.Millisecond,
+		PoolTimeout:  time.Duration(redisCfg.PoolTimeoutMs) * time.Millisecond,
+		MaxRetries:   redisCfg.MaxRetries,
+		PoolSize:     redisCfg.PoolSize,
+		MinIdleConns: redisCfg.MinIdleConns,
 	})
+}
+
+func withRedisTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, redisOpTimeoutDuration())
+}
+
+func isRedisFastFailActive(now time.Time) bool {
+	return now.UnixNano() < redisFastFailUntil.Load()
+}
+
+func markRedisFastFail(now time.Time, reason string, err error) {
+	redisFastFailUntil.Store(now.Add(redisFastFailWindowDuration()).UnixNano())
+	if err != nil {
+		logThrottled("redis_fast_fail_"+reason, 2*time.Second, "Redis 快速失败窗口开启: reason=%s err=%v", reason, err)
+	}
+}
+
+func clearRedisFastFail() {
+	if redisFastFailUntil.Load() != 0 {
+		redisFastFailUntil.Store(0)
+	}
+}
+
+func redisOpTimeoutDuration() time.Duration {
+	timeoutMs := cfg.Redis.OpTimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = defaultRedisOpTimeoutMs
+	}
+	return time.Duration(timeoutMs) * time.Millisecond
+}
+
+func redisFastFailWindowDuration() time.Duration {
+	windowMs := cfg.Redis.FastFailWindowMs
+	if windowMs <= 0 {
+		windowMs = defaultRedisFastFailWindowMs
+	}
+	return time.Duration(windowMs) * time.Millisecond
 }
 
 // ---------------- 配置文件加载 ----------------
@@ -754,15 +859,25 @@ func isBlacklisted(ctx context.Context, ip string) bool {
 		blacklistCacheMu.Unlock()
 		return false
 	}
+	if isRedisFastFailActive(now) {
+		blacklistCacheMu.Lock()
+		blacklistMissCache[ip] = now.Add(time.Second)
+		blacklistCacheMu.Unlock()
+		return false
+	}
 
-	ttl, err := rdb.PTTL(ctx, "blacklist:"+ip).Result()
+	redisCtx, cancel := withRedisTimeout(ctx)
+	ttl, err := rdb.PTTL(redisCtx, "blacklist:"+ip).Result()
+	cancel()
 	if err != nil {
+		markRedisFastFail(now, "is_blacklisted", err)
 		logThrottled("redis_is_blacklisted", 3*time.Second, "Redis error in isBlacklisted: %v", err)
 		blacklistCacheMu.Lock()
 		blacklistMissCache[ip] = now.Add(time.Second)
 		blacklistCacheMu.Unlock()
 		return false
 	}
+	clearRedisFastFail()
 
 	if ttl > 0 {
 		blacklistCacheMu.Lock()
@@ -1034,8 +1149,11 @@ func syncIPSetFromRedis() {
 	if rdb == nil {
 		return
 	}
+	if isRedisFastFailActive(time.Now()) {
+		logThrottled("redis_sync_fast_fail", 3*time.Second, "Redis->ipset 同步跳过：Redis 快速失败窗口生效")
+		return
+	}
 
-	ctx := context.Background()
 	cursor := getRedisSyncCursor()
 	pattern := "blacklist:*"
 	count := int64(100)
@@ -1047,11 +1165,15 @@ func syncIPSetFromRedis() {
 			break
 		}
 
-		keys, nextCursor, err := rdb.Scan(ctx, cursor, pattern, count).Result()
+		scanCtx, scanCancel := withRedisTimeout(context.Background())
+		keys, nextCursor, err := rdb.Scan(scanCtx, cursor, pattern, count).Result()
+		scanCancel()
 		if err != nil {
+			markRedisFastFail(time.Now(), "sync_scan", err)
 			log.Printf("Redis scan error in syncIPSetFromRedis: %v", err)
 			return
 		}
+		clearRedisFastFail()
 
 		for _, key := range keys {
 			if processed >= cfg.Limits.IpsetSyncMaxPerRound {
@@ -1070,10 +1192,13 @@ func syncIPSetFromRedis() {
 			}
 			ip := parsedIP.String()
 
-			ttl, err := rdb.PTTL(ctx, key).Result()
+			pttlCtx, pttlCancel := withRedisTimeout(context.Background())
+			ttl, err := rdb.PTTL(pttlCtx, key).Result()
+			pttlCancel()
 			if err != nil {
+				markRedisFastFail(time.Now(), "sync_pttl", err)
 				log.Printf("Redis PTTL error for %s: %v", key, err)
-				continue
+				return
 			}
 
 			if ttl >= redisSyncMinPTTL {
@@ -1262,17 +1387,29 @@ func banIP(ctx context.Context, ip string) {
 		applyLocalFallbackBan(ip, "redis_not_initialized")
 		return
 	}
+	now := time.Now()
+	if isRedisFastFailActive(now) {
+		applyLocalFallbackBan(ip, "redis_fast_fail_window")
+		return
+	}
 
 	strikeKey := "abuse:" + ip
-	strikes, err := rdb.Incr(ctx, strikeKey).Result()
+	strikeCtx, strikeCancel := withRedisTimeout(ctx)
+	strikes, err := rdb.Incr(strikeCtx, strikeKey).Result()
+	strikeCancel()
 	if err != nil {
+		markRedisFastFail(now, "ban_strike_incr", err)
 		logThrottled("redis_ban_strike_incr", 3*time.Second, "Redis error in banIP strike increment: %v", err)
 		applyLocalFallbackBan(ip, "strike_increment_error")
 		return
 	}
-	if err := rdb.Expire(ctx, strikeKey, 30*time.Minute).Err(); err != nil {
+	clearRedisFastFail()
+	strikeExpireCtx, strikeExpireCancel := withRedisTimeout(ctx)
+	if err := rdb.Expire(strikeExpireCtx, strikeKey, 30*time.Minute).Err(); err != nil {
+		markRedisFastFail(time.Now(), "ban_strike_expire", err)
 		logThrottled("redis_ban_strike_expire", 3*time.Second, "Redis error in banIP strike expire: %v", err)
 	}
+	strikeExpireCancel()
 
 	banIncrement := banDurationByStrikes(strikes)
 	banDuration := calculateCumulativeBanDuration(ctx, ip, banIncrement)
@@ -1282,14 +1419,18 @@ func banIP(ctx context.Context, ip string) {
 		return
 	}
 
-	updated, err := setBlacklistWithMaxTTL(ctx, "blacklist:"+ip, "blacklist_level:"+ip, banDuration, banLevel)
+	setCtx, setCancel := withRedisTimeout(ctx)
+	updated, err := setBlacklistWithMaxTTL(setCtx, "blacklist:"+ip, "blacklist_level:"+ip, banDuration, banLevel)
+	setCancel()
 	if err != nil {
+		markRedisFastFail(time.Now(), "ban_set_blacklist", err)
 		logThrottled("redis_ban_set_blacklist", 3*time.Second, "Redis error in banIP: %v", err)
 		cacheBlacklistLocal(ip, banDuration)
 		syncIPSetBan(ip, banDuration)
 		log.Printf("Redis 不可用，已执行本地封禁兜底: ip=%s, 封禁时长=%s", ip, banDuration)
 		return
 	}
+	clearRedisFastFail()
 	if !updated {
 		return
 	}
@@ -1306,18 +1447,29 @@ func incConn(ctx context.Context, ip string) (bool, error) {
 	if rdb == nil {
 		return true, nil
 	}
+	now := time.Now()
+	if isRedisFastFailActive(now) {
+		return true, nil
+	}
 
 	// 使用时间窗口前缀防止单 key 热点
-	timeWindow := time.Now().Unix() / 60 // 每分钟一个窗口
+	timeWindow := now.Unix() / 60 // 每分钟一个窗口
 	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
-	allowed, err := rdb.Incr(ctx, key).Result()
+	incCtx, incCancel := withRedisTimeout(ctx)
+	allowed, err := rdb.Incr(incCtx, key).Result()
+	incCancel()
 	if err != nil {
+		markRedisFastFail(now, "inc_conn", err)
 		logThrottled("redis_inc_conn", 3*time.Second, "Redis error in incConn: %v", err)
 		return true, nil
 	}
-	if err := rdb.Expire(ctx, key, time.Minute).Err(); err != nil {
+	clearRedisFastFail()
+	expireCtx, expireCancel := withRedisTimeout(ctx)
+	if err := rdb.Expire(expireCtx, key, time.Minute).Err(); err != nil {
+		markRedisFastFail(time.Now(), "inc_conn_expire", err)
 		logThrottled("redis_inc_conn_expire", 3*time.Second, "Redis error in incConn expire: %v", err)
 	}
+	expireCancel()
 	return allowed <= int64(cfg.RateLimit.MaxConn), nil
 }
 
@@ -1325,12 +1477,18 @@ func decConn(ctx context.Context, ip string) {
 	if rdb == nil {
 		return
 	}
+	if isRedisFastFailActive(time.Now()) {
+		return
+	}
 
 	timeWindow := time.Now().Unix() / 60
 	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
-	if err := rdb.Decr(ctx, key).Err(); err != nil {
+	decCtx, decCancel := withRedisTimeout(ctx)
+	if err := rdb.Decr(decCtx, key).Err(); err != nil {
+		markRedisFastFail(time.Now(), "dec_conn", err)
 		log.Println("Redis error in decConn:", err)
 	}
+	decCancel()
 }
 
 // ---------------- 滑动窗口限流 ----------------
@@ -2055,6 +2213,17 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dialHeaders := buildBackendWSDialHeader(r, ip)
+	logThrottled(
+		"ws_forward_headers",
+		2*time.Second,
+		"WebSocket 转发头: clientIP=%s X-Real-IP=%s X-Forwarded-For=%s X-Forwarded-Host=%s X-Forwarded-Uri=%s X-Forwarded-Proto=%s",
+		ip,
+		dialHeaders.Get("X-Real-IP"),
+		dialHeaders.Get("X-Forwarded-For"),
+		dialHeaders.Get("X-Forwarded-Host"),
+		dialHeaders.Get("X-Forwarded-Uri"),
+		dialHeaders.Get("X-Forwarded-Proto"),
+	)
 	var targetConn *websocket.Conn
 	var dialErr error
 
@@ -2312,7 +2481,7 @@ func main() {
 	}
 
 	// 初始化 Redis
-	initRedis(cfg.Redis.Addr, cfg.Redis.DB, cfg.Redis.Password)
+	initRedis(cfg.Redis)
 
 	// 系统初始化（ipset/iptables）
 	if err := initSystem(); err != nil {
@@ -2471,11 +2640,20 @@ func currentRedisBanDuration(ctx context.Context, ip string) time.Duration {
 	if rdb == nil {
 		return 0
 	}
-
-	ttl, err := rdb.PTTL(ctx, "blacklist:"+ip).Result()
-	if err != nil || ttl <= 0 {
+	if isRedisFastFailActive(time.Now()) {
 		return 0
 	}
+
+	pttlCtx, pttlCancel := withRedisTimeout(ctx)
+	ttl, err := rdb.PTTL(pttlCtx, "blacklist:"+ip).Result()
+	pttlCancel()
+	if err != nil || ttl <= 0 {
+		if err != nil {
+			markRedisFastFail(time.Now(), "current_ban_duration", err)
+		}
+		return 0
+	}
+	clearRedisFastFail()
 	if ttl > maxCumulativeBanDuration {
 		return maxCumulativeBanDuration
 	}

@@ -38,7 +38,16 @@ go mod download
   "redis": {
     "addr": "127.0.0.1:6379",
     "db": 14,
-    "password": ""
+    "password": "",
+    "opTimeoutMs": 500,
+    "fastFailWindowMs": 2000,
+    "dialTimeoutMs": 500,
+    "readTimeoutMs": 500,
+    "writeTimeoutMs": 500,
+    "poolTimeoutMs": 500,
+    "poolSize": 128,
+    "minIdleConns": 16,
+    "maxRetries": -1
   },
   "cluster": {
     "enable": false,
@@ -107,6 +116,15 @@ go mod download
 - `redis.addr`：Redis 服务器地址
 - `redis.db`：Redis 数据库编号
 - `redis.password`：Redis 密码（无密码留空）
+- `redis.opTimeoutMs`：Redis 操作超时（毫秒，默认 `500`）
+- `redis.fastFailWindowMs`：Redis 快速失败窗口（毫秒，默认 `2000`）
+- `redis.dialTimeoutMs`：Redis 建连超时（毫秒，默认 `500`）
+- `redis.readTimeoutMs`：Redis 读超时（毫秒，默认 `500`）
+- `redis.writeTimeoutMs`：Redis 写超时（毫秒，默认 `500`）
+- `redis.poolTimeoutMs`：Redis 连接池等待超时（毫秒，默认 `500`）
+- `redis.poolSize`：Redis 连接池大小（默认 `128`）
+- `redis.minIdleConns`：Redis 最小空闲连接数（默认 `16`）
+- `redis.maxRetries`：Redis 命令重试次数（默认 `-1`，表示禁用重试）
 - `cluster.enable`：是否启用 Gossip 集群同步（默认 false）
 - `cluster.bindAddr`：memberlist 监听地址（默认 `0.0.0.0`）
 - `cluster.bindPort`：memberlist 监听端口（默认 `7946`）

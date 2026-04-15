@@ -3,7 +3,16 @@
   "redis": {
     "addr": "127.0.0.1:6379",
     "db": 14,
-    "password": ""
+    "password": "",
+    "opTimeoutMs": 500,
+    "fastFailWindowMs": 2000,
+    "dialTimeoutMs": 500,
+    "readTimeoutMs": 500,
+    "writeTimeoutMs": 500,
+    "poolTimeoutMs": 500,
+    "poolSize": 128,
+    "minIdleConns": 16,
+    "maxRetries": -1
   },
   "cluster": {
     "enable": false,
