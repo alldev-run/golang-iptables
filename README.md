@@ -90,6 +90,11 @@ go mod download
     "ipsetCacheMaxEntries": 200000,
     "ipsetSyncMaxPerRound": 50000,
     "blacklistIpKeyMaxLen": 64,
+    "localBanPersistEnabled": true,
+    "localBanPersistFile": "./data/local_bans.json",
+    "localBanPersistWindowSec": 1800,
+    "localBanPersistFlushMs": 3000,
+    "localBanPersistMaxEntries": 50000,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }
@@ -133,6 +138,11 @@ go mod download
 - `limits.ipsetCacheMaxEntries`：ipset 本地缓存最大条目数（默认 200000，用于控制内存上限）
 - `limits.ipsetSyncMaxPerRound`：每轮 Redis→ipset 最大同步条目数（默认 50000，防止单轮同步过载）
 - `limits.blacklistIpKeyMaxLen`：blacklist key 中 IP 最大长度（默认 64，过滤异常 key）
+- `limits.localBanPersistEnabled`：是否启用本地短期封禁持久化（默认 true）
+- `limits.localBanPersistFile`：本地短期封禁快照文件路径（默认 `./data/local_bans.json`）
+- `limits.localBanPersistWindowSec`：本地短期封禁持久化窗口（秒，默认 1800，范围 600~3600）
+- `limits.localBanPersistFlushMs`：本地短期封禁快照刷盘间隔（毫秒，默认 3000）
+- `limits.localBanPersistMaxEntries`：本地短期封禁快照最大条目（默认 50000）
 - `limits.machineHealthCheckSec`：机器健康检查间隔（秒，默认 2）
 - `limits.machineMaxCPUPercent`：CPU 使用率熔断阈值（%，默认 92）
 - `limits.machineMaxLoadPerCpu`：每核 Load 熔断阈值（默认 1.5）
@@ -171,6 +181,13 @@ go test -v
 5. 其它节点收到事件后会做去重、源节点判断、来源 CIDR 白名单校验，再执行 `ipset`
 
 > 说明：Redis 在本项目中保持弱依赖。即使 Redis 不可用，本地限流与本地兜底封禁仍可工作；集群内封禁传播由 memberlist Gossip 负责。
+
+### 本地短期持久化（推荐）
+
+- 模型：`本机内存 + 本地文件`，不依赖 Redis
+- 目的：节点重启后自动恢复近期封禁，避免瞬时空窗
+- 建议窗口：`10 分钟 ~ 1 小时`（程序会自动约束在该范围）
+- 恢复逻辑：启动时回放未过期封禁并立即补写本机 `ipset`
 
 **本地三节点联调（快速验证）：**
 

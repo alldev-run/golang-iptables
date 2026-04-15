@@ -953,6 +953,90 @@ func TestCalculateCumulativeBanDuration_CappedAt30Days(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfig_LocalBanPersistWindowClamp(t *testing.T) {
+	c := defaultConfig()
+	c.Limits.LocalBanPersistWindowSec = 120
+	c.Limits.LocalBanPersistFile = ""
+	normalizeConfig(&c)
+
+	if c.Limits.LocalBanPersistWindowSec != 600 {
+		t.Fatalf("localBanPersistWindowSec 下限应为 600，got=%d", c.Limits.LocalBanPersistWindowSec)
+	}
+	if c.Limits.LocalBanPersistFile != defaultLocalBanPersistFile {
+		t.Fatalf("localBanPersistFile 空值应回落默认值，got=%q want=%q", c.Limits.LocalBanPersistFile, defaultLocalBanPersistFile)
+	}
+
+	c = defaultConfig()
+	c.Limits.LocalBanPersistWindowSec = 7201
+	normalizeConfig(&c)
+	if c.Limits.LocalBanPersistWindowSec != 3600 {
+		t.Fatalf("localBanPersistWindowSec 上限应为 3600，got=%d", c.Limits.LocalBanPersistWindowSec)
+	}
+}
+
+func TestLocalBanPersistSnapshot_RestoreRecentOnly(t *testing.T) {
+	originalCfg := cfg
+	originalHitCache := blacklistHitCache
+	originalMissCache := blacklistMissCache
+	originalIPSetCache := ipsetCache
+	originalQueue := ipsetQueue
+	defer func() {
+		cfg = originalCfg
+		blacklistCacheMu.Lock()
+		blacklistHitCache = originalHitCache
+		blacklistMissCache = originalMissCache
+		blacklistCacheMu.Unlock()
+		ipsetCache = originalIPSetCache
+		ipsetQueue = originalQueue
+		localBanPersistDirty.Store(false)
+	}()
+
+	cfg = defaultConfig()
+	cfg.Limits.LocalBanPersistEnabled = true
+	cfg.Limits.LocalBanPersistFile = t.TempDir() + "/local_bans.json"
+	cfg.Limits.LocalBanPersistWindowSec = 1800
+	cfg.Limits.LocalBanPersistMaxEntries = 100
+
+	blacklistCacheMu.Lock()
+	blacklistHitCache = make(map[string]time.Time)
+	blacklistMissCache = make(map[string]time.Time)
+	blacklistCacheMu.Unlock()
+	ipsetCache = make(map[string]time.Time)
+	ipsetQueue = make(chan ipsetBanTask, 16)
+
+	now := time.Now()
+	cacheBlacklistLocalUntil("198.51.100.7", now.Add(5*time.Minute), false)
+	cacheBlacklistLocalUntil("198.51.100.8", now.Add(2*time.Hour), false)
+	localBanPersistDirty.Store(true)
+	flushLocalBanSnapshotToFile()
+
+	blacklistCacheMu.Lock()
+	blacklistHitCache = make(map[string]time.Time)
+	blacklistMissCache = make(map[string]time.Time)
+	blacklistCacheMu.Unlock()
+	ipsetCache = make(map[string]time.Time)
+	for len(ipsetQueue) > 0 {
+		<-ipsetQueue
+	}
+
+	restoreLocalBanSnapshotFromFile()
+
+	blacklistCacheMu.RLock()
+	_, hasRecent := blacklistHitCache["198.51.100.7"]
+	_, hasTooLong := blacklistHitCache["198.51.100.8"]
+	blacklistCacheMu.RUnlock()
+
+	if !hasRecent {
+		t.Fatalf("应恢复窗口内短期封禁记录")
+	}
+	if hasTooLong {
+		t.Fatalf("不应恢复超出窗口的长期封禁记录")
+	}
+	if len(ipsetQueue) != 1 {
+		t.Fatalf("应仅回放 1 条 ipset 任务，got=%d", len(ipsetQueue))
+	}
+}
+
 func TestConfigSchemaConsistency(t *testing.T) {
 	baseBytes, err := os.ReadFile("config.json")
 	if err != nil {

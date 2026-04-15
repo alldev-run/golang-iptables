@@ -35,6 +35,10 @@ const (
 	defaultMaxBlacklistIPKeyLen = 64
 	redisSyncMinPTTL            = 200 * time.Millisecond
 	maxCumulativeBanDuration    = 30 * 24 * time.Hour
+	defaultLocalBanPersistWindowSec = 1800
+	defaultLocalBanPersistFlushMs   = 3000
+	defaultLocalBanPersistMaxEntries = 50000
+	defaultLocalBanPersistFile       = "./data/local_bans.json"
 )
 
 var (
@@ -127,6 +131,11 @@ return 0
 
 	ipsetCleanupTicker *time.Ticker
 	ipsetCleanupDone   chan struct{}
+
+	localBanPersistMu    sync.Mutex
+	localBanPersistDirty atomic.Bool
+	localBanPersistStop  chan struct{}
+	localBanPersistWG    sync.WaitGroup
 )
 
 type Config struct {
@@ -176,8 +185,23 @@ type LimitConfig struct {
 	IpsetCacheMaxEntries int `json:"ipsetCacheMaxEntries"` // ipset 本地缓存最大条目数
 	IpsetSyncMaxPerRound int `json:"ipsetSyncMaxPerRound"` // 每轮 Redis->ipset 最大同步条目数
 	BlacklistIPKeyMaxLen int `json:"blacklistIpKeyMaxLen"` // blacklist key 中 IP 最大长度
+	LocalBanPersistEnabled bool `json:"localBanPersistEnabled"` // 是否启用本地短期封禁持久化
+	LocalBanPersistFile string `json:"localBanPersistFile"` // 本地短期封禁持久化文件路径
+	LocalBanPersistWindowSec int `json:"localBanPersistWindowSec"` // 本地短期封禁持久化窗口（秒）
+	LocalBanPersistFlushMs int `json:"localBanPersistFlushMs"` // 本地短期封禁持久化刷盘间隔（毫秒）
+	LocalBanPersistMaxEntries int `json:"localBanPersistMaxEntries"` // 本地短期封禁持久化最大条目
 	AuthTimeoutSec      int `json:"authTimeoutSec"`      // 认证超时 (秒)
 	ShutdownTimeoutSec  int `json:"shutdownTimeoutSec"`  // 优雅关闭超时 (秒)
+}
+
+type localBanPersistRecord struct {
+	IP           string `json:"ip"`
+	ExpireAtUnix int64  `json:"expireAtUnix"`
+}
+
+type localBanPersistSnapshot struct {
+	UpdatedAtUnix int64                   `json:"updatedAtUnix"`
+	Records       []localBanPersistRecord `json:"records"`
 }
 
 type cpuSnapshot struct {
@@ -265,6 +289,11 @@ func defaultConfig() Config {
 			IpsetCacheMaxEntries: defaultMaxIPSetCacheEntries,
 			IpsetSyncMaxPerRound: defaultMaxRedisSyncPerRound,
 			BlacklistIPKeyMaxLen: defaultMaxBlacklistIPKeyLen,
+			LocalBanPersistEnabled: true,
+			LocalBanPersistFile: defaultLocalBanPersistFile,
+			LocalBanPersistWindowSec: defaultLocalBanPersistWindowSec,
+			LocalBanPersistFlushMs: defaultLocalBanPersistFlushMs,
+			LocalBanPersistMaxEntries: defaultLocalBanPersistMaxEntries,
 			AuthTimeoutSec:      3,
 			ShutdownTimeoutSec:  30,
 		},
@@ -404,6 +433,25 @@ func normalizeConfig(c *Config) {
 	}
 	if c.Limits.BlacklistIPKeyMaxLen <= 0 {
 		c.Limits.BlacklistIPKeyMaxLen = defaultMaxBlacklistIPKeyLen
+	}
+	if c.Limits.LocalBanPersistFile == "" {
+		c.Limits.LocalBanPersistFile = defaultLocalBanPersistFile
+	}
+	c.Limits.LocalBanPersistFile = strings.TrimSpace(c.Limits.LocalBanPersistFile)
+	if c.Limits.LocalBanPersistWindowSec <= 0 {
+		c.Limits.LocalBanPersistWindowSec = defaultLocalBanPersistWindowSec
+	}
+	if c.Limits.LocalBanPersistWindowSec < 600 {
+		c.Limits.LocalBanPersistWindowSec = 600
+	}
+	if c.Limits.LocalBanPersistWindowSec > 3600 {
+		c.Limits.LocalBanPersistWindowSec = 3600
+	}
+	if c.Limits.LocalBanPersistFlushMs <= 0 {
+		c.Limits.LocalBanPersistFlushMs = defaultLocalBanPersistFlushMs
+	}
+	if c.Limits.LocalBanPersistMaxEntries <= 0 {
+		c.Limits.LocalBanPersistMaxEntries = defaultLocalBanPersistMaxEntries
 	}
 	if c.Limits.AuthTimeoutSec <= 0 {
 		c.Limits.AuthTimeoutSec = 3
@@ -780,6 +828,186 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 
 	cacheBlacklistLocal(ipLocal, banDuration)
 	enqueueIPSetBan(ipLocal, banDuration)
+}
+
+func localBanPersistEnabled() bool {
+	if !cfg.Limits.LocalBanPersistEnabled {
+		return false
+	}
+	return strings.TrimSpace(cfg.Limits.LocalBanPersistFile) != ""
+}
+
+func markLocalBanPersistDirty() {
+	if !localBanPersistEnabled() {
+		return
+	}
+	localBanPersistDirty.Store(true)
+}
+
+func startLocalBanPersistWorker() {
+	if localBanPersistStop != nil {
+		return
+	}
+
+	localBanPersistStop = make(chan struct{})
+	localBanPersistWG.Add(1)
+	go func() {
+		defer localBanPersistWG.Done()
+
+		for {
+			flushMs := cfg.Limits.LocalBanPersistFlushMs
+			if flushMs <= 0 {
+				flushMs = defaultLocalBanPersistFlushMs
+			}
+
+			timer := time.NewTimer(time.Duration(flushMs) * time.Millisecond)
+			select {
+			case <-timer.C:
+				if localBanPersistDirty.Load() {
+					flushLocalBanSnapshotToFile()
+				}
+			case <-localBanPersistStop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				flushLocalBanSnapshotToFile()
+				return
+			}
+		}
+	}()
+}
+
+func stopLocalBanPersistWorker() {
+	if localBanPersistStop == nil {
+		return
+	}
+	close(localBanPersistStop)
+	localBanPersistWG.Wait()
+	localBanPersistStop = nil
+}
+
+func flushLocalBanSnapshotToFile() {
+	if !localBanPersistEnabled() {
+		return
+	}
+
+	path := strings.TrimSpace(cfg.Limits.LocalBanPersistFile)
+	if path == "" {
+		return
+	}
+
+	localBanPersistMu.Lock()
+	defer localBanPersistMu.Unlock()
+
+	now := time.Now()
+	window := time.Duration(cfg.Limits.LocalBanPersistWindowSec) * time.Second
+	maxEntries := cfg.Limits.LocalBanPersistMaxEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultLocalBanPersistMaxEntries
+	}
+
+	snapshot := localBanPersistSnapshot{
+		UpdatedAtUnix: now.Unix(),
+		Records:       make([]localBanPersistRecord, 0, maxEntries),
+	}
+
+	blacklistCacheMu.RLock()
+	for ip, expireAt := range blacklistHitCache {
+		if !expireAt.After(now) {
+			continue
+		}
+		if expireAt.Sub(now) > window {
+			continue
+		}
+		snapshot.Records = append(snapshot.Records, localBanPersistRecord{IP: ip, ExpireAtUnix: expireAt.Unix()})
+		if len(snapshot.Records) >= maxEntries {
+			break
+		}
+	}
+	blacklistCacheMu.RUnlock()
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		logThrottled("local_ban_persist_marshal", 3*time.Second, "本地短期封禁快照序列化失败: %v", err)
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		logThrottled("local_ban_persist_mkdir", 3*time.Second, "本地短期封禁快照创建目录失败: %v", err)
+		return
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		logThrottled("local_ban_persist_write", 3*time.Second, "本地短期封禁快照写入失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logThrottled("local_ban_persist_rename", 3*time.Second, "本地短期封禁快照替换失败: %v", err)
+		return
+	}
+
+	localBanPersistDirty.Store(false)
+}
+
+func restoreLocalBanSnapshotFromFile() {
+	if !localBanPersistEnabled() {
+		return
+	}
+
+	path := strings.TrimSpace(cfg.Limits.LocalBanPersistFile)
+	if path == "" {
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("读取本地短期封禁快照失败: %v", err)
+		}
+		return
+	}
+
+	var snapshot localBanPersistSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		log.Printf("解析本地短期封禁快照失败: %v", err)
+		return
+	}
+
+	now := time.Now()
+	window := time.Duration(cfg.Limits.LocalBanPersistWindowSec) * time.Second
+	restored := 0
+
+	for _, record := range snapshot.Records {
+		ip := strings.TrimSpace(record.IP)
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			continue
+		}
+		ip = parsedIP.String()
+
+		expireAt := time.Unix(record.ExpireAtUnix, 0)
+		if !expireAt.After(now) {
+			continue
+		}
+		remaining := expireAt.Sub(now)
+		if remaining > window {
+			continue
+		}
+
+		cacheBlacklistLocalUntil(ip, expireAt, false)
+		if upsertIPSetCacheWithCap(ip, expireAt) {
+			enqueueIPSetBan(ip, remaining)
+		}
+		restored++
+	}
+
+	if restored > 0 {
+		log.Printf("本地短期封禁快照恢复完成: %d 条", restored)
+	}
 }
 
 func syncIPSetFromRedis() {
@@ -1948,6 +2176,8 @@ func main() {
 	go startIPSetSync()
 	go startIPSetCleanup()
 	startIPSetWorkers()
+	restoreLocalBanSnapshotFromFile()
+	startLocalBanPersistWorker()
 	startClusterMesh()
 
 	http.HandleFunc("/", proxyHandler)
@@ -1977,6 +2207,7 @@ func main() {
 
 	log.Println("正在关闭服务器...")
 
+	stopLocalBanPersistWorker()
 	stopIPSetCleanup()
 	stopIPSetWorkers()
 	stopClusterMesh()
@@ -1996,12 +2227,35 @@ func cacheBlacklistLocal(ip string, banDuration time.Duration) {
 	if banDuration <= 0 {
 		return
 	}
+	cacheBlacklistLocalUntil(ip, time.Now().Add(banDuration), true)
+}
+
+func cacheBlacklistLocalUntil(ip string, expireAt time.Time, persist bool) {
+	ip = strings.TrimSpace(ip)
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return
+	}
+	ip = parsedIP.String()
+
+	if !expireAt.After(time.Now()) {
+		return
+	}
 
 	blacklistCacheMu.Lock()
 	enforceBlacklistHitCacheCapLocked(ip)
-	blacklistHitCache[ip] = time.Now().Add(banDuration)
+	if currentExpireAt, exists := blacklistHitCache[ip]; exists && !expireAt.After(currentExpireAt) {
+		delete(blacklistMissCache, ip)
+		blacklistCacheMu.Unlock()
+		return
+	}
+	blacklistHitCache[ip] = expireAt
 	delete(blacklistMissCache, ip)
 	blacklistCacheMu.Unlock()
+
+	if persist {
+		markLocalBanPersistDirty()
+	}
 }
 
 func incrementLocalStrike(ip string, now time.Time) int64 {

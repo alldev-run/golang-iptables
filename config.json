@@ -55,6 +55,11 @@
     "ipsetCacheMaxEntries": 200000,
     "ipsetSyncMaxPerRound": 50000,
     "blacklistIpKeyMaxLen": 64,
+    "localBanPersistEnabled": true,
+    "localBanPersistFile": "./data/local_bans.json",
+    "localBanPersistWindowSec": 1800,
+    "localBanPersistFlushMs": 3000,
+    "localBanPersistMaxEntries": 50000,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }

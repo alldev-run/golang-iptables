@@ -35,6 +35,7 @@ write_node_config() {
   local file="$1"
   local gossip_port="$2"
   local join_json="$3"
+  local persist_file="$4"
 
   cat >"$file" <<EOF
 {
@@ -89,6 +90,11 @@ write_node_config() {
     "ipsetCacheMaxEntries": 200000,
     "ipsetSyncMaxPerRound": 50000,
     "blacklistIpKeyMaxLen": 64,
+    "localBanPersistEnabled": true,
+    "localBanPersistFile": "${persist_file}",
+    "localBanPersistWindowSec": 1800,
+    "localBanPersistFlushMs": 1000,
+    "localBanPersistMaxEntries": 50000,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }
@@ -120,9 +126,13 @@ LOG1="$TMP_DIR/node1.log"
 LOG2="$TMP_DIR/node2.log"
 LOG3="$TMP_DIR/node3.log"
 
-write_node_config "$CFG1" "$GOSSIP1" "[]"
-write_node_config "$CFG2" "$GOSSIP2" "[\"${SEED_ADDR}\"]"
-write_node_config "$CFG3" "$GOSSIP3" "[\"${SEED_ADDR}\"]"
+PERSIST1="$TMP_DIR/node1-local-bans.json"
+PERSIST2="$TMP_DIR/node2-local-bans.json"
+PERSIST3="$TMP_DIR/node3-local-bans.json"
+
+write_node_config "$CFG1" "$GOSSIP1" "[]" "$PERSIST1"
+write_node_config "$CFG2" "$GOSSIP2" "[\"${SEED_ADDR}\"]" "$PERSIST2"
+write_node_config "$CFG3" "$GOSSIP3" "[\"${SEED_ADDR}\"]" "$PERSIST3"
 
 start_node "node1" "$PORT1" "$CFG1" "$LOG1"
 sleep 1
@@ -135,6 +145,10 @@ echo "- node1 http: http://127.0.0.1:${PORT1}"
 echo "- node2 http: http://127.0.0.1:${PORT2}"
 echo "- node3 http: http://127.0.0.1:${PORT3}"
 echo "- logs dir : ${TMP_DIR}"
+echo "- local ban snapshots:"
+echo "  - node1: ${PERSIST1}"
+echo "  - node2: ${PERSIST2}"
+echo "  - node3: ${PERSIST3}"
 echo
 echo "Try a manual ban on node1:"
 echo "curl -s -X POST http://127.0.0.1:${PORT1}/admin/ban \\
@@ -144,6 +158,11 @@ echo "curl -s -X POST http://127.0.0.1:${PORT1}/admin/ban \\
 echo
 echo "Then watch logs on other nodes:"
 echo "tail -f ${LOG2} ${LOG3}"
+echo
+echo "To verify restart recovery (example for node2):"
+echo "1) kill \\$(pgrep -f 'main.go ${PORT2} ${CFG2}')"
+echo "2) (cd ${ROOT_DIR} && go run main.go ${PORT2} ${CFG2})"
+echo "3) check ${PERSIST2} and node2 logs for local ban restore"
 echo
 echo "Press Ctrl+C to stop all nodes and clean temp files."
 
