@@ -173,6 +173,7 @@ type LimitConfig struct {
 	MachineMaxMemoryPercent float64 `json:"machineMaxMemoryPercent"` // 内存使用率阈值 (%)
 	MachineUnhealthyThreshold int   `json:"machineUnhealthyThreshold"` // 连续异常次数触发熔断
 	MachineRecoveryThreshold  int   `json:"machineRecoveryThreshold"`  // 连续恢复次数关闭熔断
+	IpsetSyncIntervalSec int `json:"ipsetSyncIntervalSec"` // ipset 从 Redis 同步间隔 (秒，0 表示不同步)
 	AuthTimeoutSec      int `json:"authTimeoutSec"`      // 认证超时 (秒)
 	ShutdownTimeoutSec  int `json:"shutdownTimeoutSec"`  // 优雅关闭超时 (秒)
 }
@@ -214,6 +215,7 @@ func defaultConfig() Config {
 			MachineMaxMemoryPercent: 95,
 			MachineUnhealthyThreshold: 3,
 			MachineRecoveryThreshold:  3,
+			IpsetSyncIntervalSec: 30,
 			AuthTimeoutSec:      3,
 			ShutdownTimeoutSec:  30,
 		},
@@ -620,6 +622,92 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 			log.Printf("ipset error: %v, output=%s", err, strings.TrimSpace(string(output)))
 		}
 	}(expireAt)
+}
+
+func syncIPSetFromRedis() {
+	if rdb == nil {
+		return
+	}
+
+	ctx := context.Background()
+	var cursor uint64
+	pattern := "blacklist:*"
+	count := int64(100)
+
+	for {
+		keys, nextCursor, err := rdb.Scan(ctx, cursor, pattern, count).Result()
+		if err != nil {
+			log.Printf("Redis scan error in syncIPSetFromRedis: %v", err)
+			return
+		}
+
+		for _, key := range keys {
+			ip := strings.TrimPrefix(key, "blacklist:")
+			ttl, err := rdb.TTL(ctx, key).Result()
+			if err != nil {
+				log.Printf("Redis TTL error for %s: %v", key, err)
+				continue
+			}
+
+			if ttl > 0 {
+				ipsetMutex.Lock()
+				currentExpireAt, ok := ipsetCache[ip]
+				newExpireAt := time.Now().Add(ttl)
+				if !ok || newExpireAt.After(currentExpireAt) {
+					ipsetCache[ip] = newExpireAt
+				}
+				ipsetMutex.Unlock()
+
+				go func(ip string, banDuration time.Duration) {
+					sem := ipsetSem
+					if sem == nil {
+						return
+					}
+					sem <- struct{}{}
+					defer func() { <-sem }()
+
+					banSeconds := int(banDuration.Seconds())
+					if banSeconds <= 0 {
+						return
+					}
+
+					cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
+					defer cmdCancel()
+
+					cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ip, "timeout", fmt.Sprintf("%d", banSeconds))
+					if output, err := cmd.CombinedOutput(); err != nil {
+						log.Printf("ipset sync error for %s: %v, output=%s", ip, err, strings.TrimSpace(string(output)))
+					}
+				}(ip, ttl)
+			}
+		}
+
+		if nextCursor == 0 {
+			break
+		}
+		cursor = nextCursor
+	}
+}
+
+func startIPSetSync() {
+	if cfg.Limits.IpsetSyncIntervalSec <= 0 {
+		log.Println("ipset 定期同步已禁用")
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(time.Duration(cfg.Limits.IpsetSyncIntervalSec) * time.Second)
+		defer ticker.Stop()
+
+		log.Printf("启动 ipset 定期同步，间隔 %d 秒", cfg.Limits.IpsetSyncIntervalSec)
+		for {
+			select {
+			case <-ticker.C:
+				log.Println("开始从 Redis 同步黑名单到 ipset")
+				syncIPSetFromRedis()
+			}
+		}
+	}()
 }
 
 func banIP(ctx context.Context, ip string) {
@@ -1468,6 +1556,7 @@ func main() {
 	// 启动配置文件监听
 	go watchConfig()
 	go startMachineHealthCircuitBreaker()
+	go startIPSetSync()
 
 	http.HandleFunc("/", proxyHandler)
 	http.HandleFunc("/admin/ban", adminBanHandler)

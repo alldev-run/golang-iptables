@@ -65,6 +65,7 @@ go mod download
     "machineMaxMemoryPercent": 95,
     "machineUnhealthyThreshold": 3,
     "machineRecoveryThreshold": 3,
+    "ipsetSyncIntervalSec": 30,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }
@@ -91,6 +92,7 @@ go mod download
 - `limits.webSocketMaxLifetimeSec`：WebSocket 最大连接生命周期（秒，默认 7200）
 - `limits.ipsetConcurrency`：ipset 并发数（默认 10）
 - `limits.ipsetTimeoutSec`：ipset 命令超时（秒，默认 5）
+- `limits.ipsetSyncIntervalSec`：ipset 从 Redis 同步间隔（秒，默认 30，0 表示不同步）
 - `limits.machineHealthCheckSec`：机器健康检查间隔（秒，默认 2）
 - `limits.machineMaxCPUPercent`：CPU 使用率熔断阈值（%，默认 92）
 - `limits.machineMaxLoadPerCpu`：每核 Load 熔断阈值（默认 1.5）

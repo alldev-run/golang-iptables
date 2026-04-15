@@ -33,6 +33,7 @@
     "machineMaxMemoryPercent": 100,
     "machineUnhealthyThreshold": 3,
     "machineRecoveryThreshold": 3,
+    "ipsetSyncIntervalSec": 30,
     "authTimeoutSec": 3,
     "shutdownTimeoutSec": 15
   }
