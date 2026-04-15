@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -36,12 +37,23 @@ var (
 	// Redis
 	rdb *redis.Client
 
-	// 限流序列号
-	rateLimitSeq uint64
-
 	// ipset 去重锁
 	ipsetMutex sync.Mutex
 	ipsetCache = make(map[string]time.Time)
+	ipsetQueue chan ipsetBanTask
+	ipsetStop  chan struct{}
+	ipsetWG    sync.WaitGroup
+
+	blacklistCacheMu    sync.RWMutex
+	blacklistHitCache   = make(map[string]time.Time)
+	blacklistMissCache  = make(map[string]time.Time)
+	localStrikeMu       sync.Mutex
+	localStrikeCache    = make(map[string]localStrikeState)
+	rateLimiter         localRateLimiter
+	rateLimiterConfig   rateLimiterConfigSnapshot
+	rateLimiterConfigMu sync.Mutex
+	logThrottleMu       sync.Mutex
+	logThrottleLastAt   = make(map[string]time.Time)
 
 	blacklistSetMaxTTLScript = redis.NewScript(`
 local ttl = redis.call("PTTL", KEYS[1])
@@ -61,40 +73,6 @@ end
 return 0
 `)
 
-	rateLimitGlobalAndIPScript = redis.NewScript(`
-local now = tonumber(ARGV[1])
-local window = tonumber(ARGV[2])
-local globalLimit = tonumber(ARGV[3])
-local ipLimit = tonumber(ARGV[4])
-
-redis.call("ZADD", KEYS[1], now, ARGV[5])
-redis.call("ZREMRANGEBYSCORE", KEYS[1], "0", tostring(now - window))
-local globalCount = redis.call("ZCARD", KEYS[1])
-redis.call("PEXPIRE", KEYS[1], window)
-if globalCount > globalLimit then
-	return 0
-end
-
-redis.call("ZADD", KEYS[2], now, ARGV[6])
-redis.call("ZREMRANGEBYSCORE", KEYS[2], "0", tostring(now - window))
-local ipCount = redis.call("ZCARD", KEYS[2])
-redis.call("PEXPIRE", KEYS[2], window)
-if ipCount > ipLimit then
-	return 1
-end
-
-return 2
-`)
-
-	connWindowLimitScript = redis.NewScript(`
-local val = redis.call("INCR", KEYS[1])
-redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
-if val <= tonumber(ARGV[2]) then
-	return 1
-end
-return 0
-`)
-
 	proxyTransport = &http.Transport{
 		Proxy:                  http.ProxyFromEnvironment,
 		DialContext:            (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -104,6 +82,7 @@ return 0
 		ExpectContinueTimeout:  1 * time.Second,
 		ResponseHeaderTimeout:  5 * time.Second,
 		MaxResponseHeaderBytes: 1 << 20,
+		MaxConnsPerHost:        100,
 	}
 
 	// ipset 并发限制（防止 ipset 慢或卡住时拖垮服务）
@@ -130,6 +109,9 @@ return 0
 	machineHealthyStreak   int
 	machineCircuitOpen     atomic.Bool
 	machineCircuitReason   atomic.Value
+
+	ipsetCleanupTicker *time.Ticker
+	ipsetCleanupDone   chan struct{}
 )
 
 type Config struct {
@@ -138,6 +120,7 @@ type Config struct {
 	RateLimit      RateLimitConfig `json:"rateLimit"`
 	Auth           AuthConfig      `json:"auth"`
 	TrustedProxies []string        `json:"trustedProxies"`
+	AdminAllowedNetworks []string  `json:"adminAllowedNetworks"`
 	Limits         LimitConfig     `json:"limits"`
 	EnableWebSocket bool           `json:"enableWebSocket"`
 }
@@ -183,6 +166,35 @@ type cpuSnapshot struct {
 	idle  uint64
 }
 
+type ipsetBanTask struct {
+	ip         string
+	banSeconds int
+}
+
+type tokenBucket struct {
+	tokens     float64
+	lastRefill time.Time
+	lastSeen   time.Time
+}
+
+type localRateLimiter struct {
+	mu         sync.Mutex
+	global     tokenBucket
+	ipBuckets  map[string]*tokenBucket
+	lastGCAt   time.Time
+}
+
+type rateLimiterConfigSnapshot struct {
+	maxRequests       int
+	globalMaxRequests int
+	windowSec         int
+}
+
+type localStrikeState struct {
+	count    int64
+	expireAt time.Time
+}
+
 func defaultConfig() Config {
 	return Config{
 		Backend: "127.0.0.1:9502",
@@ -202,6 +214,7 @@ func defaultConfig() Config {
 			AdminToken: "",
 		},
 		TrustedProxies: []string{"127.0.0.1/8", "::1/128"},
+		AdminAllowedNetworks: []string{"127.0.0.1/8", "::1/128"},
 		Limits: LimitConfig{
 			MaxConnections:      5000,
 			MaxBodySizeMB:       10,
@@ -246,6 +259,24 @@ func normalizeConfig(c *Config) {
 		filteredTrustedProxies = []string{"127.0.0.1/8", "::1/128"}
 	}
 	c.TrustedProxies = filteredTrustedProxies
+
+	filteredAdminAllowedNetworks := make([]string, 0, len(c.AdminAllowedNetworks))
+	seenAdminAllowedNetworks := make(map[string]struct{}, len(c.AdminAllowedNetworks))
+	for _, network := range c.AdminAllowedNetworks {
+		network = strings.TrimSpace(network)
+		if network == "" {
+			continue
+		}
+		if _, exists := seenAdminAllowedNetworks[network]; exists {
+			continue
+		}
+		seenAdminAllowedNetworks[network] = struct{}{}
+		filteredAdminAllowedNetworks = append(filteredAdminAllowedNetworks, network)
+	}
+	if len(filteredAdminAllowedNetworks) == 0 {
+		filteredAdminAllowedNetworks = []string{"127.0.0.1/8", "::1/128"}
+	}
+	c.AdminAllowedNetworks = filteredAdminAllowedNetworks
 
 	if c.RateLimit.MaxRequests <= 0 {
 		c.RateLimit.MaxRequests = 100
@@ -386,6 +417,14 @@ func applyConfig(newCfg Config) error {
 		log.Println("代理错误:", err)
 		http.Error(w, "Bad Gateway", 502)
 	}
+	reverseProxy.BufferPool = nil
+	reverseProxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.ContentLength > 0 && resp.ContentLength > int64(cfg.Limits.MaxBodySizeMB)*1024*1024 {
+			_ = resp.Body.Close()
+			return fmt.Errorf("response body too large: %d bytes", resp.ContentLength)
+		}
+		return nil
+	}
 	httpReverseProxy.Store(reverseProxy)
 
 	upgrader.ReadBufferSize = cfg.Limits.WebSocketBufferSize
@@ -393,6 +432,7 @@ func applyConfig(newCfg Config) error {
 
 	ipsetSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
 	connSem = make(chan struct{}, cfg.Limits.MaxConnections)
+	resetLocalRateLimiter()
 
 	return nil
 }
@@ -488,10 +528,8 @@ func getClientIP(r *http.Request) string {
 
 	// 仅在可信代理来源下信任 X-Forwarded-For，避免被外部直连请求伪造
 	if remoteIP.IsLoopback() || isTrustedProxyIP(remoteIP) {
-		xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
-		if xff != "" {
-			first := strings.TrimSpace(strings.Split(xff, ",")[0])
-			if forwardedIP := net.ParseIP(first); forwardedIP != nil {
+		if forwarded := firstForwardedIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+			if forwardedIP := net.ParseIP(forwarded); forwardedIP != nil {
 				return forwardedIP.String()
 			}
 		}
@@ -511,12 +549,57 @@ func isWebSocket(r *http.Request) bool {
 
 // ---------------- 黑名单 ----------------
 func isBlacklisted(ctx context.Context, ip string) bool {
-	val, err := rdb.Exists(ctx, "blacklist:"+ip).Result()
-	if err != nil {
-		log.Println("Redis error in isBlacklisted:", err)
+	now := time.Now()
+
+	blacklistCacheMu.RLock()
+	hitExpire, hitFound := blacklistHitCache[ip]
+	missExpire, missFound := blacklistMissCache[ip]
+	blacklistCacheMu.RUnlock()
+
+	if hitFound {
+		if now.Before(hitExpire) {
+			return true
+		}
+		blacklistCacheMu.Lock()
+		if exp, ok := blacklistHitCache[ip]; ok && !now.Before(exp) {
+			delete(blacklistHitCache, ip)
+		}
+		blacklistCacheMu.Unlock()
+	}
+
+	if missFound && now.Before(missExpire) {
 		return false
 	}
-	return val == 1
+
+	if rdb == nil {
+		blacklistCacheMu.Lock()
+		blacklistMissCache[ip] = now.Add(time.Second)
+		blacklistCacheMu.Unlock()
+		return false
+	}
+
+	ttl, err := rdb.TTL(ctx, "blacklist:"+ip).Result()
+	if err != nil {
+		logThrottled("redis_is_blacklisted", 3*time.Second, "Redis error in isBlacklisted: %v", err)
+		blacklistCacheMu.Lock()
+		blacklistMissCache[ip] = now.Add(time.Second)
+		blacklistCacheMu.Unlock()
+		return false
+	}
+
+	if ttl > 0 {
+		blacklistCacheMu.Lock()
+		blacklistHitCache[ip] = now.Add(ttl)
+		delete(blacklistMissCache, ip)
+		blacklistCacheMu.Unlock()
+		return true
+	}
+
+	blacklistCacheMu.Lock()
+	blacklistMissCache[ip] = now.Add(time.Second)
+	delete(blacklistHitCache, ip)
+	blacklistCacheMu.Unlock()
+	return false
 }
 
 func banDurationByStrikes(strikes int64) time.Duration {
@@ -570,58 +653,8 @@ func syncIPSetBan(ip string, banDuration time.Duration) {
 	ipsetCache[ipLocal] = expireAt
 	ipsetMutex.Unlock()
 
-	go func(expectedExpireAt time.Time) {
-		sleepFor := time.Until(expectedExpireAt)
-		if sleepFor > 0 {
-			time.Sleep(sleepFor)
-		}
-		ipsetMutex.Lock()
-		current, exists := ipsetCache[ipLocal]
-		if exists && !current.After(expectedExpireAt) {
-			delete(ipsetCache, ipLocal)
-		}
-		ipsetMutex.Unlock()
-	}(expireAt)
-
-	go func(expectedExpireAt time.Time) {
-		sem := ipsetSem
-		if sem == nil {
-			log.Println("ipset semaphore 未初始化，跳过 ipset 同步")
-			return
-		}
-
-		ipsetMutex.Lock()
-		current, exists := ipsetCache[ipLocal]
-		if !exists || current.After(expectedExpireAt) {
-			ipsetMutex.Unlock()
-			return
-		}
-		ipsetMutex.Unlock()
-
-		sem <- struct{}{}
-		defer func() { <-sem }()
-
-		ipsetMutex.Lock()
-		current, exists = ipsetCache[ipLocal]
-		if !exists || current.After(expectedExpireAt) {
-			ipsetMutex.Unlock()
-			return
-		}
-		ipsetMutex.Unlock()
-
-		cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
-		defer cmdCancel()
-
-		banSeconds := int(time.Until(expectedExpireAt).Seconds())
-		if banSeconds <= 0 {
-			return
-		}
-
-		cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ipLocal, "timeout", fmt.Sprintf("%d", banSeconds))
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("ipset error: %v, output=%s", err, strings.TrimSpace(string(output)))
-		}
-	}(expireAt)
+	cacheBlacklistLocal(ipLocal, banDuration)
+	enqueueIPSetBan(ipLocal, banDuration)
 }
 
 func syncIPSetFromRedis() {
@@ -657,28 +690,8 @@ func syncIPSetFromRedis() {
 					ipsetCache[ip] = newExpireAt
 				}
 				ipsetMutex.Unlock()
-
-				go func(ip string, banDuration time.Duration) {
-					sem := ipsetSem
-					if sem == nil {
-						return
-					}
-					sem <- struct{}{}
-					defer func() { <-sem }()
-
-					banSeconds := int(banDuration.Seconds())
-					if banSeconds <= 0 {
-						return
-					}
-
-					cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
-					defer cmdCancel()
-
-					cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ip, "timeout", fmt.Sprintf("%d", banSeconds))
-					if output, err := cmd.CombinedOutput(); err != nil {
-						log.Printf("ipset sync error for %s: %v, output=%s", ip, err, strings.TrimSpace(string(output)))
-					}
-				}(ip, ttl)
+				cacheBlacklistLocal(ip, ttl)
+				enqueueIPSetBan(ip, ttl)
 			}
 		}
 
@@ -710,15 +723,139 @@ func startIPSetSync() {
 	}()
 }
 
+func startIPSetCleanup() {
+	ipsetCleanupTicker = time.NewTicker(60 * time.Second)
+	ipsetCleanupDone = make(chan struct{})
+	go func() {
+		defer ipsetCleanupTicker.Stop()
+		for {
+			select {
+			case <-ipsetCleanupTicker.C:
+				ipsetMutex.Lock()
+				now := time.Now()
+				for ip, expireAt := range ipsetCache {
+					if now.After(expireAt) {
+						delete(ipsetCache, ip)
+					}
+				}
+				ipsetMutex.Unlock()
+
+				blacklistCacheMu.Lock()
+				for ip, expireAt := range blacklistHitCache {
+					if now.After(expireAt) {
+						delete(blacklistHitCache, ip)
+					}
+				}
+				for ip, expireAt := range blacklistMissCache {
+					if now.After(expireAt) {
+						delete(blacklistMissCache, ip)
+					}
+				}
+				blacklistCacheMu.Unlock()
+
+				localStrikeMu.Lock()
+				for ip, state := range localStrikeCache {
+					if now.After(state.expireAt) {
+						delete(localStrikeCache, ip)
+					}
+				}
+				localStrikeMu.Unlock()
+			case <-ipsetCleanupDone:
+				return
+			}
+		}
+	}()
+}
+
+func stopIPSetCleanup() {
+	if ipsetCleanupDone != nil {
+		close(ipsetCleanupDone)
+	}
+}
+
+func startIPSetWorkers() {
+	if ipsetQueue != nil {
+		return
+	}
+
+	workerCount := cfg.Limits.IpsetConcurrency
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	ipsetQueue = make(chan ipsetBanTask, workerCount*256)
+	ipsetStop = make(chan struct{})
+
+	for i := 0; i < workerCount; i++ {
+		ipsetWG.Add(1)
+		go func() {
+			defer ipsetWG.Done()
+			for {
+				select {
+				case <-ipsetStop:
+					return
+				case task := <-ipsetQueue:
+					runIPSetAdd(task.ip, task.banSeconds)
+				}
+			}
+		}()
+	}
+}
+
+func stopIPSetWorkers() {
+	if ipsetStop == nil {
+		return
+	}
+	close(ipsetStop)
+	ipsetWG.Wait()
+	ipsetStop = nil
+	ipsetQueue = nil
+}
+
+func enqueueIPSetBan(ip string, banDuration time.Duration) {
+	banSeconds := int(banDuration.Seconds())
+	if banSeconds <= 0 {
+		return
+	}
+
+	if ipsetQueue == nil {
+		runIPSetAdd(ip, banSeconds)
+		return
+	}
+
+	task := ipsetBanTask{ip: ip, banSeconds: banSeconds}
+	select {
+	case ipsetQueue <- task:
+	default:
+		logThrottled("ipset_queue_drop", 2*time.Second, "ipset 队列拥堵，丢弃任务: ip=%s timeout=%d", ip, banSeconds)
+	}
+}
+
+func runIPSetAdd(ip string, banSeconds int) {
+	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
+	defer cmdCancel()
+
+	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ip, "timeout", fmt.Sprintf("%d", banSeconds))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		logThrottled("ipset_add_error", 2*time.Second, "ipset error: %v, output=%s", err, strings.TrimSpace(string(output)))
+	}
+}
+
 func banIP(ctx context.Context, ip string) {
+	if rdb == nil {
+		applyLocalFallbackBan(ip, "redis_not_initialized")
+		return
+	}
+
 	strikeKey := "abuse:" + ip
 	strikes, err := rdb.Incr(ctx, strikeKey).Result()
 	if err != nil {
-		log.Println("Redis error in banIP strike increment:", err)
+		logThrottled("redis_ban_strike_incr", 3*time.Second, "Redis error in banIP strike increment: %v", err)
+		applyLocalFallbackBan(ip, "strike_increment_error")
 		return
 	}
 	if err := rdb.Expire(ctx, strikeKey, 30*time.Minute).Err(); err != nil {
-		log.Println("Redis error in banIP strike expire:", err)
+		logThrottled("redis_ban_strike_expire", 3*time.Second, "Redis error in banIP strike expire: %v", err)
 	}
 
 	banDuration := banDurationByStrikes(strikes)
@@ -730,7 +867,10 @@ func banIP(ctx context.Context, ip string) {
 
 	updated, err := setBlacklistWithMaxTTL(ctx, "blacklist:"+ip, "blacklist_level:"+ip, banDuration, banLevel)
 	if err != nil {
-		log.Println("Redis error in banIP:", err)
+		logThrottled("redis_ban_set_blacklist", 3*time.Second, "Redis error in banIP: %v", err)
+		cacheBlacklistLocal(ip, banDuration)
+		syncIPSetBan(ip, banDuration)
+		log.Printf("Redis 不可用，已执行本地封禁兜底: ip=%s, 封禁时长=%s", ip, banDuration)
 		return
 	}
 	if !updated {
@@ -739,22 +879,35 @@ func banIP(ctx context.Context, ip string) {
 
 	log.Printf("封禁IP: %s, 违规次数=%d, 封禁时长=%s", ip, strikes, banDuration)
 
+	cacheBlacklistLocal(ip, banDuration)
 	syncIPSetBan(ip, banDuration)
 }
 
 // ---------------- 分布式连接数 ----------------
 func incConn(ctx context.Context, ip string) (bool, error) {
+	if rdb == nil {
+		return true, nil
+	}
+
 	// 使用时间窗口前缀防止单 key 热点
 	timeWindow := time.Now().Unix() / 60 // 每分钟一个窗口
 	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
-	allowed, err := connWindowLimitScript.Run(ctx, rdb, []string{key}, 60, cfg.RateLimit.MaxConn).Int64()
+	allowed, err := rdb.Incr(ctx, key).Result()
 	if err != nil {
-		return false, err
+		logThrottled("redis_inc_conn", 3*time.Second, "Redis error in incConn: %v", err)
+		return true, nil
 	}
-	return allowed == 1, nil
+	if err := rdb.Expire(ctx, key, time.Minute).Err(); err != nil {
+		logThrottled("redis_inc_conn_expire", 3*time.Second, "Redis error in incConn expire: %v", err)
+	}
+	return allowed <= int64(cfg.RateLimit.MaxConn), nil
 }
 
 func decConn(ctx context.Context, ip string) {
+	if rdb == nil {
+		return
+	}
+
 	timeWindow := time.Now().Unix() / 60
 	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
 	if err := rdb.Decr(ctx, key).Err(); err != nil {
@@ -764,47 +917,47 @@ func decConn(ctx context.Context, ip string) {
 
 // ---------------- 滑动窗口限流 ----------------
 func allowRequestWithReason(ctx context.Context, ip string) (bool, string) {
-	now := time.Now().UnixMilli()
-	member := strconv.FormatInt(now, 10) + "-" + strconv.FormatUint(atomic.AddUint64(&rateLimitSeq, 1), 10)
+	_ = ctx
+
 	windowSec := cfg.RateLimit.WindowSec
-	windowMillis := int64(windowSec) * 1000
-	if windowMillis <= 0 {
-		windowMillis = 10000
-	}
 	if cfg.RateLimit.GlobalMaxRequests <= 0 {
 		return false, "global"
 	}
 	if cfg.RateLimit.MaxRequests <= 0 {
 		return false, "ip"
 	}
-
-	result, err := rateLimitGlobalAndIPScript.Run(
-		ctx,
-		rdb,
-		[]string{"rate:global", "rate:ip:" + ip},
-		now,
-		windowMillis,
-		cfg.RateLimit.GlobalMaxRequests,
-		cfg.RateLimit.MaxRequests,
-		member+"-g",
-		member+"-i",
-	).Int64()
-	if err != nil {
-		log.Println("Redis error in allowRequest:", err)
-		return false, "redis"
+	if windowSec <= 0 {
+		windowSec = 10
 	}
 
-	switch result {
-	case 2:
-		return true, ""
-	case 1:
-		return false, "ip"
-	case 0:
+	ensureRateLimiterConfig()
+
+	now := time.Now()
+	rateLimiter.mu.Lock()
+	defer rateLimiter.mu.Unlock()
+
+	gcLocalIPBuckets(now, windowSec)
+
+	globalCapacity := float64(cfg.RateLimit.GlobalMaxRequests)
+	globalRefill := globalCapacity / float64(windowSec)
+	if !consumeToken(&rateLimiter.global, globalCapacity, globalRefill, now) {
 		return false, "global"
-	default:
-		log.Printf("Unexpected rate limit result: %d", result)
-		return false, "redis"
 	}
+
+	bucket, ok := rateLimiter.ipBuckets[ip]
+	if !ok {
+		bucket = &tokenBucket{}
+		rateLimiter.ipBuckets[ip] = bucket
+	}
+
+	ipCapacity := float64(cfg.RateLimit.MaxRequests)
+	ipRefill := ipCapacity / float64(windowSec)
+	if !consumeToken(bucket, ipCapacity, ipRefill, now) {
+		refundToken(&rateLimiter.global, globalCapacity)
+		return false, "ip"
+	}
+
+	return true, ""
 }
 
 func allowRequest(ctx context.Context, ip string) bool {
@@ -824,6 +977,25 @@ func auth(r *http.Request) bool {
 	return token != "" && token == cfg.Auth.Token
 }
 
+func isAdminAllowedIP(r *http.Request) bool {
+	ip := net.ParseIP(getClientIP(r))
+	if ip == nil {
+		return false
+	}
+
+	for _, network := range cfg.AdminAllowedNetworks {
+		_, ipNet, err := net.ParseCIDR(network)
+		if err == nil && ipNet.Contains(ip) {
+			return true
+		}
+		if network == ip.String() {
+			return true
+		}
+	}
+
+	return false
+}
+
 func adminAuth(r *http.Request) bool {
 	token := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
@@ -832,7 +1004,7 @@ func adminAuth(r *http.Request) bool {
 	if token == "" {
 		token = strings.TrimSpace(r.Header.Get("X-Admin-Token"))
 	}
-	return token != "" && token == cfg.Auth.AdminToken
+	return token != "" && token == cfg.Auth.AdminToken && isAdminAllowedIP(r)
 }
 
 // ---------------- 内部管理接口 ----------------
@@ -875,22 +1047,25 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 		duration = time.Duration(req.Duration) * time.Second
 	}
 
+	redisPersisted := false
 	if rdb == nil {
-		log.Printf("Redis client not initialized in admin ban")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+		logThrottled("admin_ban_redis_nil", 3*time.Second, "Redis client not initialized in admin ban")
+	} else {
+		ctx := context.Background()
+		blacklistKey := "blacklist:" + ipStr
+		levelKey := "blacklist_level:" + ipStr
+		if _, err := setBlacklistWithMaxTTL(ctx, blacklistKey, levelKey, duration, 3); err != nil {
+			logThrottled("admin_ban_redis_error", 3*time.Second, "Redis error in admin ban: %v", err)
+		} else {
+			redisPersisted = true
+		}
 	}
 
-	ctx := context.Background()
-	blacklistKey := "blacklist:" + ipStr
-	levelKey := "blacklist_level:" + ipStr
-	if _, err := setBlacklistWithMaxTTL(ctx, blacklistKey, levelKey, duration, 3); err != nil {
-		log.Printf("Redis error in admin ban: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
+	cacheBlacklistLocal(ipStr, duration)
 	syncIPSetBan(ipStr, duration)
+	if !redisPersisted {
+		log.Printf("Admin ban 已走本地兜底: ip=%s, duration=%v", ipStr, duration)
+	}
 
 	reason := req.Reason
 	if reason == "" {
@@ -975,16 +1150,20 @@ func readCPUSnapshot() (cpuSnapshot, error) {
 	if err != nil {
 		return cpuSnapshot{}, err
 	}
-	line := strings.SplitN(string(data), "\n", 2)[0]
-	fields := strings.Fields(line)
-	if len(fields) < 5 || fields[0] != "cpu" {
+	lineEnd := bytes.IndexByte(data, '\n')
+	if lineEnd < 0 {
+		lineEnd = len(data)
+	}
+	line := data[:lineEnd]
+	fields := bytes.Fields(line)
+	if len(fields) < 5 || !bytes.Equal(fields[0], []byte("cpu")) {
 		return cpuSnapshot{}, fmt.Errorf("invalid /proc/stat format")
 	}
 
 	var total uint64
-	values := make([]uint64, 0, len(fields)-1)
+	values := make([]uint64, 0, 10)
 	for _, field := range fields[1:] {
-		v, parseErr := strconv.ParseUint(field, 10, 64)
+		v, parseErr := parseUintASCII(field)
 		if parseErr != nil {
 			return cpuSnapshot{}, parseErr
 		}
@@ -1024,11 +1203,14 @@ func readLoadPerCPU() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
+	firstTokenEnd := bytes.IndexByte(data, ' ')
+	if firstTokenEnd < 0 {
+		firstTokenEnd = bytes.IndexByte(data, '\n')
+	}
+	if firstTokenEnd <= 0 {
 		return 0, fmt.Errorf("invalid /proc/loadavg format")
 	}
-	load1, err := strconv.ParseFloat(fields[0], 64)
+	load1, err := strconv.ParseFloat(string(data[:firstTokenEnd]), 64)
 	if err != nil {
 		return 0, err
 	}
@@ -1046,22 +1228,31 @@ func readMemoryUsagePercent() (float64, error) {
 	}
 	var total float64
 	var available float64
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+	for len(data) > 0 {
+		lineEnd := bytes.IndexByte(data, '\n')
+		line := data
+		if lineEnd >= 0 {
+			line = data[:lineEnd]
+			data = data[lineEnd+1:]
+		} else {
+			data = nil
+		}
+
+		if bytes.HasPrefix(line, []byte("MemTotal:")) {
+			v, parseErr := parseFirstUintAfterColon(line)
+			if parseErr != nil {
+				return 0, parseErr
+			}
+			total = float64(v)
 			continue
 		}
-		switch fields[0] {
-		case "MemTotal:":
-			total, err = strconv.ParseFloat(fields[1], 64)
-			if err != nil {
-				return 0, err
+
+		if bytes.HasPrefix(line, []byte("MemAvailable:")) {
+			v, parseErr := parseFirstUintAfterColon(line)
+			if parseErr != nil {
+				return 0, parseErr
 			}
-		case "MemAvailable:":
-			available, err = strconv.ParseFloat(fields[1], 64)
-			if err != nil {
-				return 0, err
-			}
+			available = float64(v)
 		}
 	}
 	if total <= 0 {
@@ -1315,9 +1506,36 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 使用单一后端
 	target := cfg.Backend
-	targetConn, _, err := websocket.DefaultDialer.Dial("ws://"+target, nil)
-	if err != nil {
-		log.Println("后端连接失败:", target, err)
+	var targetConn *websocket.Conn
+	var dialErr error
+
+	const maxRetries = 3
+	const baseRetryDelay = 100 * time.Millisecond
+
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			delay := baseRetryDelay * time.Duration(1<<uint(retry-1))
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+			log.Printf("WebSocket 后端连接重试 %d/%d，等待 %v", retry, maxRetries, delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				_ = clientWS.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "connection canceled"))
+				return
+			}
+		}
+
+		targetConn, _, dialErr = websocket.DefaultDialer.Dial("ws://"+target, nil)
+		if dialErr == nil {
+			break
+		}
+		log.Printf("WebSocket 后端连接失败 (尝试 %d/%d): %v", retry+1, maxRetries, dialErr)
+	}
+
+	if dialErr != nil {
+		log.Println("WebSocket 后端连接最终失败:", target, dialErr)
 		_ = clientWS.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "backend connection error"))
 		return
 	}
@@ -1557,6 +1775,8 @@ func main() {
 	go watchConfig()
 	go startMachineHealthCircuitBreaker()
 	go startIPSetSync()
+	go startIPSetCleanup()
+	startIPSetWorkers()
 
 	http.HandleFunc("/", proxyHandler)
 	http.HandleFunc("/admin/ban", adminBanHandler)
@@ -1585,6 +1805,9 @@ func main() {
 
 	log.Println("正在关闭服务器...")
 
+	stopIPSetCleanup()
+	stopIPSetWorkers()
+
 	// 优雅关闭，等待现有请求完成
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.ShutdownTimeoutSec)*time.Second)
 	defer cancel()
@@ -1594,4 +1817,190 @@ func main() {
 	}
 
 	log.Println("服务器已关闭")
+}
+
+func cacheBlacklistLocal(ip string, banDuration time.Duration) {
+	if banDuration <= 0 {
+		return
+	}
+
+	blacklistCacheMu.Lock()
+	blacklistHitCache[ip] = time.Now().Add(banDuration)
+	delete(blacklistMissCache, ip)
+	blacklistCacheMu.Unlock()
+}
+
+func incrementLocalStrike(ip string, now time.Time) int64 {
+	localStrikeMu.Lock()
+	defer localStrikeMu.Unlock()
+
+	state := localStrikeCache[ip]
+	if now.After(state.expireAt) {
+		state.count = 0
+	}
+	state.count++
+	state.expireAt = now.Add(30 * time.Minute)
+	localStrikeCache[ip] = state
+	return state.count
+}
+
+func applyLocalFallbackBan(ip string, reason string) {
+	strikes := incrementLocalStrike(ip, time.Now())
+	banDuration := banDurationByStrikes(strikes)
+	if banDuration <= 0 {
+		logThrottled("local_fallback_no_ban", 3*time.Second, "本地兜底记录违规但未封禁: ip=%s, strikes=%d, reason=%s", ip, strikes, reason)
+		return
+	}
+
+	cacheBlacklistLocal(ip, banDuration)
+	syncIPSetBan(ip, banDuration)
+	log.Printf("本地兜底封禁生效: ip=%s, strikes=%d, duration=%s, reason=%s", ip, strikes, banDuration, reason)
+}
+
+func ensureRateLimiterConfig() {
+	rateLimiterConfigMu.Lock()
+	defer rateLimiterConfigMu.Unlock()
+
+	current := rateLimiterConfigSnapshot{
+		maxRequests:       cfg.RateLimit.MaxRequests,
+		globalMaxRequests: cfg.RateLimit.GlobalMaxRequests,
+		windowSec:         cfg.RateLimit.WindowSec,
+	}
+	if current == rateLimiterConfig {
+		return
+	}
+	rateLimiterConfig = current
+	resetLocalRateLimiter()
+}
+
+func resetLocalRateLimiter() {
+	rateLimiter.mu.Lock()
+	defer rateLimiter.mu.Unlock()
+
+	rateLimiter.global = tokenBucket{}
+	rateLimiter.ipBuckets = make(map[string]*tokenBucket)
+	rateLimiter.lastGCAt = time.Now()
+}
+
+func gcLocalIPBuckets(now time.Time, windowSec int) {
+	if rateLimiter.ipBuckets == nil {
+		rateLimiter.ipBuckets = make(map[string]*tokenBucket)
+		rateLimiter.lastGCAt = now
+		return
+	}
+
+	if now.Sub(rateLimiter.lastGCAt) < 30*time.Second {
+		return
+	}
+
+	idleTTL := time.Duration(windowSec*6) * time.Second
+	if idleTTL < 2*time.Minute {
+		idleTTL = 2 * time.Minute
+	}
+	deadline := now.Add(-idleTTL)
+
+	for ip, bucket := range rateLimiter.ipBuckets {
+		if bucket.lastSeen.Before(deadline) {
+			delete(rateLimiter.ipBuckets, ip)
+		}
+	}
+	rateLimiter.lastGCAt = now
+}
+
+func consumeToken(bucket *tokenBucket, capacity float64, refillPerSec float64, now time.Time) bool {
+	if capacity <= 0 || refillPerSec <= 0 {
+		return false
+	}
+
+	if bucket.lastRefill.IsZero() {
+		bucket.tokens = capacity
+		bucket.lastRefill = now
+	} else {
+		elapsed := now.Sub(bucket.lastRefill).Seconds()
+		if elapsed > 0 {
+			bucket.tokens += elapsed * refillPerSec
+			if bucket.tokens > capacity {
+				bucket.tokens = capacity
+			}
+			bucket.lastRefill = now
+		}
+	}
+
+	bucket.lastSeen = now
+	if bucket.tokens >= 1 {
+		bucket.tokens -= 1
+		return true
+	}
+	return false
+}
+
+func refundToken(bucket *tokenBucket, capacity float64) {
+	bucket.tokens += 1
+	if bucket.tokens > capacity {
+		bucket.tokens = capacity
+	}
+}
+
+func parseUintASCII(b []byte) (uint64, error) {
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty numeric field")
+	}
+
+	var v uint64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("invalid digit %q", c)
+		}
+		v = v*10 + uint64(c-'0')
+	}
+	return v, nil
+}
+
+func parseFirstUintAfterColon(line []byte) (uint64, error) {
+	colon := bytes.IndexByte(line, ':')
+	if colon < 0 || colon+1 >= len(line) {
+		return 0, fmt.Errorf("invalid meminfo line")
+	}
+
+	i := colon + 1
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	start := i
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if start == i {
+		return 0, fmt.Errorf("meminfo value not found")
+	}
+
+	return parseUintASCII(line[start:i])
+}
+
+func firstForwardedIP(xff string) string {
+	xff = strings.TrimSpace(xff)
+	if xff == "" {
+		return ""
+	}
+
+	if comma := strings.IndexByte(xff, ','); comma >= 0 {
+		xff = xff[:comma]
+	}
+
+	return strings.TrimSpace(xff)
+}
+
+func logThrottled(key string, interval time.Duration, format string, args ...any) {
+	now := time.Now()
+
+	logThrottleMu.Lock()
+	last, ok := logThrottleLastAt[key]
+	if ok && now.Sub(last) < interval {
+		logThrottleMu.Unlock()
+		return
+	}
+	logThrottleLastAt[key] = now
+	logThrottleMu.Unlock()
+
+	log.Printf(format, args...)
 }

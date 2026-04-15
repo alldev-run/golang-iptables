@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -308,7 +310,7 @@ func TestAllowRequestWithReason(t *testing.T) {
 		}
 	})
 
-	t.Run("Redis异常返回redis原因", func(t *testing.T) {
+	t.Run("Redis异常降级放行", func(t *testing.T) {
 		rdb = redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
 		cfg = defaultConfig()
 
@@ -316,8 +318,8 @@ func TestAllowRequestWithReason(t *testing.T) {
 		defer cancel()
 
 		allowed, reason := allowRequestWithReason(ctx, "1.2.3.4")
-		if allowed || reason != "redis" {
-			t.Fatalf("Redis异常应返回 redis 原因，allowed=%v reason=%q", allowed, reason)
+		if !allowed || reason != "" {
+			t.Fatalf("Redis异常应降级放行，allowed=%v reason=%q", allowed, reason)
 		}
 	})
 }
@@ -478,7 +480,7 @@ func TestBanIP_ProgressiveEscalation(t *testing.T) {
 	}
 }
 
-func TestSyncIPSetBan_StaleTaskDoesNotOverrideLatest(t *testing.T) {
+func TestSyncIPSetBan_DoesNotDowngradeExistingLongerBan(t *testing.T) {
 	originalCfg := cfg
 	originalSem := ipsetSem
 	originalCache := ipsetCache
@@ -512,15 +514,10 @@ func TestSyncIPSetBan_StaleTaskDoesNotOverrideLatest(t *testing.T) {
 	}
 
 	ipsetSem = make(chan struct{}, 1)
-	ipsetSem <- struct{}{}
 
 	ip := "1.2.3.4"
-	syncIPSetBan(ip, 2*time.Second)
-	time.Sleep(50 * time.Millisecond)
 	syncIPSetBan(ip, 5*time.Second)
-	time.Sleep(50 * time.Millisecond)
-
-	<-ipsetSem
+	syncIPSetBan(ip, 2*time.Second)
 
 	var content []byte
 	deadline := time.Now().Add(2 * time.Second)
@@ -546,8 +543,90 @@ func TestSyncIPSetBan_StaleTaskDoesNotOverrideLatest(t *testing.T) {
 
 	lines := strings.Split(trimmed, "\n")
 	if len(lines) != 1 {
-		t.Fatalf("过期任务不应执行 ipset，预期 1 次调用，实际 %d 次，内容=%q", len(lines), trimmed)
+		t.Fatalf("较短封禁不应覆盖已存在更长封禁，预期 1 次调用，实际 %d 次，内容=%q", len(lines), trimmed)
 	}
+}
+
+func TestRedisUnavailableDegradedMode(t *testing.T) {
+	originalCfg := cfg
+	originalRDB := rdb
+	originalHitCache := blacklistHitCache
+	originalMissCache := blacklistMissCache
+	defer func() {
+		cfg = originalCfg
+		rdb = originalRDB
+		blacklistCacheMu.Lock()
+		blacklistHitCache = originalHitCache
+		blacklistMissCache = originalMissCache
+		blacklistCacheMu.Unlock()
+	}()
+
+	blacklistCacheMu.Lock()
+	blacklistHitCache = make(map[string]time.Time)
+	blacklistMissCache = make(map[string]time.Time)
+	blacklistCacheMu.Unlock()
+
+	rdb = redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+	cfg = defaultConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	ip := "1.2.3.4"
+
+	if isBlacklisted(ctx, ip) {
+		t.Fatalf("Redis 不可用时，isBlacklisted 应返回 false")
+	}
+
+	allowed, reason := allowRequestWithReason(ctx, ip)
+	if !allowed || reason != "" {
+		t.Fatalf("Redis 不可用时应降级放行，allowed=%v reason=%q", allowed, reason)
+	}
+
+	connAllowed, err := incConn(ctx, ip)
+	if err != nil || !connAllowed {
+		t.Fatalf("Redis 不可用时连接计数应放行，allowed=%v err=%v", connAllowed, err)
+	}
+
+	decConn(ctx, ip)
+	banIP(ctx, ip)
+}
+
+func TestAdminAuth_AllowedNetworks(t *testing.T) {
+	originalCfg := cfg
+	defer func() {
+		cfg = originalCfg
+	}()
+
+	cfg = defaultConfig()
+	cfg.Auth.AdminToken = "test-admin-token"
+	cfg.AdminAllowedNetworks = []string{"10.0.0.0/8", "127.0.0.1/32", "203.0.113.9"}
+
+	t.Run("允许CIDR", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/admin/ban", strings.NewReader(`{"ip":"1.2.3.4"}`))
+		req.RemoteAddr = "10.8.9.10:12345"
+		req.Header.Set("Authorization", "Bearer test-admin-token")
+		if !adminAuth(req) {
+			t.Fatalf("CIDR 命中时 adminAuth 应通过")
+		}
+	})
+
+	t.Run("允许单IP", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/admin/ban", strings.NewReader(`{"ip":"1.2.3.4"}`))
+		req.RemoteAddr = "203.0.113.9:12345"
+		req.Header.Set("X-Admin-Token", "test-admin-token")
+		if !adminAuth(req) {
+			t.Fatalf("单IP 命中时 adminAuth 应通过")
+		}
+	})
+
+	t.Run("未命中网段", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/admin/ban", strings.NewReader(`{"ip":"1.2.3.4"}`))
+		req.RemoteAddr = "192.168.1.2:12345"
+		req.Header.Set("Authorization", "Bearer test-admin-token")
+		if adminAuth(req) {
+			t.Fatalf("未命中网段时 adminAuth 不应通过")
+		}
+	})
 }
 
 func TestIsDialFailure(t *testing.T) {
@@ -710,14 +789,14 @@ func TestAdminBanHandler(t *testing.T) {
 			method:         "POST",
 			authHeader:     "Bearer test-admin-token",
 			body:           `{"ip": "1.2.3.4"}`,
-			expectedStatus: http.StatusInternalServerError,
+			expectedStatus: http.StatusOK,
 		},
 		{
 			name:           "X-Admin-Token认证",
 			method:         "POST",
 			authHeader:     "test-admin-token",
 			body:           `{"ip": "1.2.3.4"}`,
-			expectedStatus: http.StatusInternalServerError,
+			expectedStatus: http.StatusOK,
 		},
 		{
 			name:           "缺少IP",
@@ -745,6 +824,7 @@ func TestAdminBanHandler(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/admin/ban", strings.NewReader(tt.body))
+			req.RemoteAddr = "127.0.0.1:12345"
 			if tt.authHeader != "" {
 				if strings.HasPrefix(strings.ToLower(tt.authHeader), "bearer ") {
 					req.Header.Set("Authorization", tt.authHeader)
@@ -772,4 +852,132 @@ func BenchmarkGetClientIP(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		getClientIP(req)
 	}
+}
+
+func TestBanIP_LocalFallbackWhenRedisUnavailable(t *testing.T) {
+	originalCfg := cfg
+	originalRDB := rdb
+	originalQueue := ipsetQueue
+	originalHitCache := blacklistHitCache
+	originalMissCache := blacklistMissCache
+	originalLocalStrikes := localStrikeCache
+	defer func() {
+		cfg = originalCfg
+		rdb = originalRDB
+		ipsetQueue = originalQueue
+		blacklistCacheMu.Lock()
+		blacklistHitCache = originalHitCache
+		blacklistMissCache = originalMissCache
+		blacklistCacheMu.Unlock()
+		localStrikeMu.Lock()
+		localStrikeCache = originalLocalStrikes
+		localStrikeMu.Unlock()
+	}()
+
+	cfg = defaultConfig()
+	rdb = nil
+	ipsetQueue = make(chan ipsetBanTask, 16)
+
+	blacklistCacheMu.Lock()
+	blacklistHitCache = make(map[string]time.Time)
+	blacklistMissCache = make(map[string]time.Time)
+	blacklistCacheMu.Unlock()
+
+	localStrikeMu.Lock()
+	localStrikeCache = make(map[string]localStrikeState)
+	localStrikeMu.Unlock()
+
+	ctx := context.Background()
+	ip := "203.0.113.55"
+
+	banIP(ctx, ip)
+	banIP(ctx, ip)
+	if isBlacklisted(ctx, ip) {
+		t.Fatalf("前两次违规不应触发本地封禁")
+	}
+
+	banIP(ctx, ip)
+	if !isBlacklisted(ctx, ip) {
+		t.Fatalf("Redis 不可用时第 3 次违规应触发本地兜底封禁")
+	}
+}
+
+func TestConfigSchemaConsistency(t *testing.T) {
+	baseBytes, err := os.ReadFile("config.json")
+	if err != nil {
+		t.Fatalf("读取 config.json 失败: %v", err)
+	}
+
+	emergencyBytes, err := os.ReadFile("config.emergency.json")
+	if err != nil {
+		t.Fatalf("读取 config.emergency.json 失败: %v", err)
+	}
+
+	var base any
+	if err := json.Unmarshal(baseBytes, &base); err != nil {
+		t.Fatalf("解析 config.json 失败: %v", err)
+	}
+
+	var emergency any
+	if err := json.Unmarshal(emergencyBytes, &emergency); err != nil {
+		t.Fatalf("解析 config.emergency.json 失败: %v", err)
+	}
+
+	basePaths := collectJSONPaths(base, "")
+	emergencyPaths := collectJSONPaths(emergency, "")
+
+	onlyInBase := diffPaths(basePaths, emergencyPaths)
+	onlyInEmergency := diffPaths(emergencyPaths, basePaths)
+
+	if len(onlyInBase) > 0 || len(onlyInEmergency) > 0 {
+		sort.Strings(onlyInBase)
+		sort.Strings(onlyInEmergency)
+		t.Fatalf("配置字段不一致:\n仅在 config.json: %v\n仅在 config.emergency.json: %v", onlyInBase, onlyInEmergency)
+	}
+}
+
+func collectJSONPaths(v any, prefix string) map[string]struct{} {
+	paths := make(map[string]struct{})
+
+	switch val := v.(type) {
+	case map[string]any:
+		if prefix != "" {
+			paths[prefix] = struct{}{}
+		}
+		for k, child := range val {
+			next := k
+			if prefix != "" {
+				next = prefix + "." + k
+			}
+			for p := range collectJSONPaths(child, next) {
+				paths[p] = struct{}{}
+			}
+		}
+	case []any:
+		arrPath := prefix + "[]"
+		if prefix != "" {
+			paths[arrPath] = struct{}{}
+		}
+		for _, child := range val {
+			for p := range collectJSONPaths(child, arrPath) {
+				paths[p] = struct{}{}
+			}
+		}
+	default:
+		if prefix != "" {
+			paths[prefix] = struct{}{}
+		}
+	}
+
+	return paths
+}
+
+func diffPaths(left map[string]struct{}, right map[string]struct{}) []string {
+	missing := make([]string, 0)
+	for k := range left {
+		if _, ok := right[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	return missing
 }

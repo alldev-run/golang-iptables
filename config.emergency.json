@@ -19,6 +19,10 @@
     "127.0.0.1/8",
     "::1/128"
   ],
+  "adminAllowedNetworks": [
+    "127.0.0.1/8",
+    "::1/128"
+  ],
   "enableWebSocket": true,
   "limits": {
     "maxConnections": 800,
