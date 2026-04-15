@@ -33,6 +33,38 @@ type ClusterConfig struct {
 	PublishMaxPerSec int      `json:"publishMaxPerSec"`
 }
 
+func buildClusterBatchPayload(pending [][]byte, limit int) ([]byte, int, error) {
+	if limit <= 0 || len(pending) == 0 {
+		return nil, 0, nil
+	}
+	if limit > len(pending) {
+		limit = len(pending)
+	}
+
+	batch := make([]json.RawMessage, 0, limit)
+	used := 0
+	var payload []byte
+
+	for i := 0; i < limit; i++ {
+		batch = append(batch, json.RawMessage(pending[i]))
+		candidate, err := json.Marshal(clusterBatchBanEvent{Type: "batch_ban", Msgs: batch})
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(candidate) > clusterBatchPayloadMaxBytes {
+			break
+		}
+		payload = candidate
+		used = i + 1
+	}
+
+	if used < 2 {
+		return nil, 0, nil
+	}
+
+	return payload, used, nil
+}
+
 type clusterBanEvent struct {
 	IP         string `json:"ip"`
 	DurationMS int64  `json:"duration"`
@@ -42,6 +74,13 @@ type clusterBanEvent struct {
 	Timestamp  int64  `json:"ts"`
 	Signature  string `json:"sig"`
 }
+
+type clusterBatchBanEvent struct {
+	Type string            `json:"type"`
+	Msgs []json.RawMessage `json:"msgs"`
+}
+
+const clusterBatchPayloadMaxBytes = 1200
 
 type clusterBroadcast struct {
 	msg    []byte
@@ -105,6 +144,17 @@ func runClusterPublishWorker(stop <-chan struct{}) {
 		}
 
 		queue := qAny.(*memberlist.TransmitLimitedQueue)
+
+		batchPayload, batchedCount, err := buildClusterBatchPayload(pending, limit)
+		if err != nil {
+			logThrottled("cluster_batch_marshal", 3*time.Second, "cluster 批量事件序列化失败，回退单条发送: %v", err)
+		}
+		if batchedCount > 1 && len(batchPayload) > 0 {
+			queue.QueueBroadcast(&clusterBroadcast{msg: batchPayload})
+			pending = pending[batchedCount:]
+			return
+		}
+
 		for i := 0; i < limit; i++ {
 			queue.QueueBroadcast(&clusterBroadcast{msg: pending[i]})
 		}
@@ -136,6 +186,24 @@ type clusterDelegate struct{}
 func (d *clusterDelegate) NodeMeta(limit int) []byte { return nil }
 
 func (d *clusterDelegate) NotifyMsg(msg []byte) {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(msg, &envelope); err == nil && envelope.Type == "batch_ban" {
+		var batch clusterBatchBanEvent
+		if err := json.Unmarshal(msg, &batch); err != nil {
+			return
+		}
+		for _, raw := range batch.Msgs {
+			d.handleBanEvent(raw)
+		}
+		return
+	}
+
+	d.handleBanEvent(msg)
+}
+
+func (d *clusterDelegate) handleBanEvent(msg []byte) {
 	var evt clusterBanEvent
 	if err := json.Unmarshal(msg, &evt); err != nil {
 		return
