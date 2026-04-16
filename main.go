@@ -30,22 +30,22 @@ import (
 )
 
 const (
-	defaultMaxIPSetCacheEntries = 200000
-	defaultMaxRedisSyncPerRound = 50000
-	defaultMaxBlacklistIPKeyLen = 64
-	redisSyncMinPTTL            = 200 * time.Millisecond
-	defaultRedisOpTimeoutMs        = 500
-	defaultRedisFastFailWindowMs   = 2000
-	defaultRedisDialTimeoutMs      = 500
-	defaultRedisReadTimeoutMs      = 500
-	defaultRedisWriteTimeoutMs     = 500
-	defaultRedisPoolTimeoutMs      = 500
-	defaultRedisPoolSize           = 128
-	defaultRedisMinIdleConns       = 16
-	defaultRedisMaxRetries         = -1
-	maxCumulativeBanDuration    = 30 * 24 * time.Hour
-	defaultLocalBanPersistWindowSec = 1800
-	defaultLocalBanPersistFlushMs   = 3000
+	defaultMaxIPSetCacheEntries      = 200000
+	defaultMaxRedisSyncPerRound      = 50000
+	defaultMaxBlacklistIPKeyLen      = 64
+	redisSyncMinPTTL                 = 200 * time.Millisecond
+	defaultRedisOpTimeoutMs          = 500
+	defaultRedisFastFailWindowMs     = 2000
+	defaultRedisDialTimeoutMs        = 500
+	defaultRedisReadTimeoutMs        = 500
+	defaultRedisWriteTimeoutMs       = 500
+	defaultRedisPoolTimeoutMs        = 500
+	defaultRedisPoolSize             = 128
+	defaultRedisMinIdleConns         = 16
+	defaultRedisMaxRetries           = -1
+	maxCumulativeBanDuration         = 30 * 24 * time.Hour
+	defaultLocalBanPersistWindowSec  = 1800
+	defaultLocalBanPersistFlushMs    = 3000
 	defaultLocalBanPersistMaxEntries = 50000
 	defaultLocalBanPersistFile       = "./data/local_bans.json"
 )
@@ -54,16 +54,20 @@ var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
+	errNetlinkUnsupported = errors.New("ipset netlink unsupported")
 
 	// Redis
 	rdb *redis.Client
 
 	// ipset 去重锁
-	ipsetMutex sync.Mutex
-	ipsetCache = make(map[string]time.Time)
-	ipsetQueue chan ipsetBanTask
-	ipsetStop  chan struct{}
-	ipsetWG    sync.WaitGroup
+	ipsetMutex    sync.Mutex
+	ipsetCache    = make(map[string]time.Time)
+	ipsetQueue    chan ipsetBanTask
+	ipsetStop     chan struct{}
+	ipsetWG       sync.WaitGroup
+	adminBanQueue chan adminBanTask
+	adminBanStop  chan struct{}
+	adminBanWG    sync.WaitGroup
 
 	blacklistCacheMu    sync.RWMutex
 	blacklistHitCache   = make(map[string]time.Time)
@@ -116,6 +120,7 @@ return 0
 
 	// ipset 并发限制（防止 ipset 慢或卡住时拖垮服务）
 	ipsetSem chan struct{}
+	banSem   chan struct{}
 
 	// 全局连接数限制（防止攻击时创建过多 goroutine）
 	connSem chan struct{}
@@ -130,6 +135,9 @@ return 0
 
 	trustedProxyMu   sync.RWMutex
 	trustedProxyNets []*net.IPNet
+	adminAllowedMu   sync.RWMutex
+	adminAllowedCfg  []string
+	adminAllowedNets []*net.IPNet
 
 	machineHealthMu        sync.Mutex
 	machinePrevCPUSnapshot cpuSnapshot
@@ -149,15 +157,15 @@ return 0
 )
 
 type Config struct {
-	Backend        string          `json:"backend"`
-	Redis          RedisConfig     `json:"redis"`
-	Cluster        ClusterConfig   `json:"cluster"`
-	RateLimit      RateLimitConfig `json:"rateLimit"`
-	Auth           AuthConfig      `json:"auth"`
-	TrustedProxies []string        `json:"trustedProxies"`
-	AdminAllowedNetworks []string  `json:"adminAllowedNetworks"`
-	Limits         LimitConfig     `json:"limits"`
-	EnableWebSocket bool           `json:"enableWebSocket"`
+	Backend              string          `json:"backend"`
+	Redis                RedisConfig     `json:"redis"`
+	Cluster              ClusterConfig   `json:"cluster"`
+	RateLimit            RateLimitConfig `json:"rateLimit"`
+	Auth                 AuthConfig      `json:"auth"`
+	TrustedProxies       []string        `json:"trustedProxies"`
+	AdminAllowedNetworks []string        `json:"adminAllowedNetworks"`
+	Limits               LimitConfig     `json:"limits"`
+	EnableWebSocket      bool            `json:"enableWebSocket"`
 }
 
 type RedisConfig struct {
@@ -188,29 +196,29 @@ type AuthConfig struct {
 }
 
 type LimitConfig struct {
-	MaxConnections      int `json:"maxConnections"`      // 全局最大连接数
-	MaxBodySizeMB       int `json:"maxBodySizeMB"`       // HTTP 请求体最大大小 (MB)
-	WebSocketBufferSize int `json:"webSocketBufferSize"` // WebSocket 缓冲区大小 (bytes)
-	WebSocketMaxLifetimeSec int `json:"webSocketMaxLifetimeSec"` // WebSocket 最大连接生命周期 (秒)
-	IpsetConcurrency    int `json:"ipsetConcurrency"`    // ipset 并发数
-	IpsetTimeoutSec     int `json:"ipsetTimeoutSec"`     // ipset 命令超时 (秒)
-	MachineHealthCheckSec   int     `json:"machineHealthCheckSec"`   // 机器健康检查间隔 (秒)
-	MachineMaxCPUPercent    float64 `json:"machineMaxCPUPercent"`    // CPU 使用率阈值 (%)
-	MachineMaxLoadPerCPU    float64 `json:"machineMaxLoadPerCpu"`    // 每核 Load 阈值
-	MachineMaxMemoryPercent float64 `json:"machineMaxMemoryPercent"` // 内存使用率阈值 (%)
-	MachineUnhealthyThreshold int   `json:"machineUnhealthyThreshold"` // 连续异常次数触发熔断
-	MachineRecoveryThreshold  int   `json:"machineRecoveryThreshold"`  // 连续恢复次数关闭熔断
-	IpsetSyncIntervalSec int `json:"ipsetSyncIntervalSec"` // ipset 从 Redis 同步间隔 (秒，0 表示不同步)
-	IpsetCacheMaxEntries int `json:"ipsetCacheMaxEntries"` // ipset 本地缓存最大条目数
-	IpsetSyncMaxPerRound int `json:"ipsetSyncMaxPerRound"` // 每轮 Redis->ipset 最大同步条目数
-	BlacklistIPKeyMaxLen int `json:"blacklistIpKeyMaxLen"` // blacklist key 中 IP 最大长度
-	LocalBanPersistEnabled bool `json:"localBanPersistEnabled"` // 是否启用本地短期封禁持久化
-	LocalBanPersistFile string `json:"localBanPersistFile"` // 本地短期封禁持久化文件路径
-	LocalBanPersistWindowSec int `json:"localBanPersistWindowSec"` // 本地短期封禁持久化窗口（秒）
-	LocalBanPersistFlushMs int `json:"localBanPersistFlushMs"` // 本地短期封禁持久化刷盘间隔（毫秒）
-	LocalBanPersistMaxEntries int `json:"localBanPersistMaxEntries"` // 本地短期封禁持久化最大条目
-	AuthTimeoutSec      int `json:"authTimeoutSec"`      // 认证超时 (秒)
-	ShutdownTimeoutSec  int `json:"shutdownTimeoutSec"`  // 优雅关闭超时 (秒)
+	MaxConnections            int     `json:"maxConnections"`            // 全局最大连接数
+	MaxBodySizeMB             int     `json:"maxBodySizeMB"`             // HTTP 请求体最大大小 (MB)
+	WebSocketBufferSize       int     `json:"webSocketBufferSize"`       // WebSocket 缓冲区大小 (bytes)
+	WebSocketMaxLifetimeSec   int     `json:"webSocketMaxLifetimeSec"`   // WebSocket 最大连接生命周期 (秒)
+	IpsetConcurrency          int     `json:"ipsetConcurrency"`          // ipset 并发数
+	IpsetTimeoutSec           int     `json:"ipsetTimeoutSec"`           // ipset 命令超时 (秒)
+	MachineHealthCheckSec     int     `json:"machineHealthCheckSec"`     // 机器健康检查间隔 (秒)
+	MachineMaxCPUPercent      float64 `json:"machineMaxCPUPercent"`      // CPU 使用率阈值 (%)
+	MachineMaxLoadPerCPU      float64 `json:"machineMaxLoadPerCpu"`      // 每核 Load 阈值
+	MachineMaxMemoryPercent   float64 `json:"machineMaxMemoryPercent"`   // 内存使用率阈值 (%)
+	MachineUnhealthyThreshold int     `json:"machineUnhealthyThreshold"` // 连续异常次数触发熔断
+	MachineRecoveryThreshold  int     `json:"machineRecoveryThreshold"`  // 连续恢复次数关闭熔断
+	IpsetSyncIntervalSec      int     `json:"ipsetSyncIntervalSec"`      // ipset 从 Redis 同步间隔 (秒，0 表示不同步)
+	IpsetCacheMaxEntries      int     `json:"ipsetCacheMaxEntries"`      // ipset 本地缓存最大条目数
+	IpsetSyncMaxPerRound      int     `json:"ipsetSyncMaxPerRound"`      // 每轮 Redis->ipset 最大同步条目数
+	BlacklistIPKeyMaxLen      int     `json:"blacklistIpKeyMaxLen"`      // blacklist key 中 IP 最大长度
+	LocalBanPersistEnabled    bool    `json:"localBanPersistEnabled"`    // 是否启用本地短期封禁持久化
+	LocalBanPersistFile       string  `json:"localBanPersistFile"`       // 本地短期封禁持久化文件路径
+	LocalBanPersistWindowSec  int     `json:"localBanPersistWindowSec"`  // 本地短期封禁持久化窗口（秒）
+	LocalBanPersistFlushMs    int     `json:"localBanPersistFlushMs"`    // 本地短期封禁持久化刷盘间隔（毫秒）
+	LocalBanPersistMaxEntries int     `json:"localBanPersistMaxEntries"` // 本地短期封禁持久化最大条目
+	AuthTimeoutSec            int     `json:"authTimeoutSec"`            // 认证超时 (秒)
+	ShutdownTimeoutSec        int     `json:"shutdownTimeoutSec"`        // 优雅关闭超时 (秒)
 }
 
 type localBanPersistRecord struct {
@@ -233,6 +241,13 @@ type ipsetBanTask struct {
 	banSeconds int
 }
 
+type adminBanTask struct {
+	ip       string
+	duration time.Duration
+	reason   string
+	unban    bool
+}
+
 type tokenBucket struct {
 	tokens     float64
 	lastRefill time.Time
@@ -240,10 +255,10 @@ type tokenBucket struct {
 }
 
 type localRateLimiter struct {
-	mu         sync.Mutex
-	global     tokenBucket
-	ipBuckets  map[string]*tokenBucket
-	lastGCAt   time.Time
+	mu        sync.Mutex
+	global    tokenBucket
+	ipBuckets map[string]*tokenBucket
+	lastGCAt  time.Time
 }
 
 type rateLimiterConfigSnapshot struct {
@@ -275,14 +290,14 @@ func defaultConfig() Config {
 			MaxRetries:       defaultRedisMaxRetries,
 		},
 		Cluster: ClusterConfig{
-			Enable:         false,
-			BindAddr:       "",
-			BindPort:       7946,
-			Join:           nil,
+			Enable:           false,
+			BindAddr:         "",
+			BindPort:         7946,
+			Join:             nil,
 			SourceAllowCIDRs: nil,
-			Secret:         "",
-			RetransmitMult: 3,
-			NodeName:       "",
+			Secret:           "",
+			RetransmitMult:   3,
+			NodeName:         "",
 			PublishQueueSize: 1024,
 			PublishBatchSize: 32,
 			PublishFlushMs:   100,
@@ -298,32 +313,32 @@ func defaultConfig() Config {
 			Token:      "123456",
 			AdminToken: "",
 		},
-		TrustedProxies: []string{"127.0.0.1/8", "::1/128"},
+		TrustedProxies:       []string{"127.0.0.1/8", "::1/128"},
 		AdminAllowedNetworks: []string{"127.0.0.1/8", "::1/128"},
 		Limits: LimitConfig{
-			MaxConnections:      5000,
-			MaxBodySizeMB:       10,
-			WebSocketBufferSize: 1024 * 1024,
-			WebSocketMaxLifetimeSec: 7200,
-			IpsetConcurrency:    10,
-			IpsetTimeoutSec:     5,
-			MachineHealthCheckSec:   2,
-			MachineMaxCPUPercent:    92,
-			MachineMaxLoadPerCPU:    1.5,
-			MachineMaxMemoryPercent: 95,
+			MaxConnections:            5000,
+			MaxBodySizeMB:             10,
+			WebSocketBufferSize:       1024 * 1024,
+			WebSocketMaxLifetimeSec:   7200,
+			IpsetConcurrency:          10,
+			IpsetTimeoutSec:           5,
+			MachineHealthCheckSec:     2,
+			MachineMaxCPUPercent:      92,
+			MachineMaxLoadPerCPU:      1.5,
+			MachineMaxMemoryPercent:   95,
 			MachineUnhealthyThreshold: 3,
 			MachineRecoveryThreshold:  3,
-			IpsetSyncIntervalSec: 30,
-			IpsetCacheMaxEntries: defaultMaxIPSetCacheEntries,
-			IpsetSyncMaxPerRound: defaultMaxRedisSyncPerRound,
-			BlacklistIPKeyMaxLen: defaultMaxBlacklistIPKeyLen,
-			LocalBanPersistEnabled: true,
-			LocalBanPersistFile: defaultLocalBanPersistFile,
-			LocalBanPersistWindowSec: defaultLocalBanPersistWindowSec,
-			LocalBanPersistFlushMs: defaultLocalBanPersistFlushMs,
+			IpsetSyncIntervalSec:      30,
+			IpsetCacheMaxEntries:      defaultMaxIPSetCacheEntries,
+			IpsetSyncMaxPerRound:      defaultMaxRedisSyncPerRound,
+			BlacklistIPKeyMaxLen:      defaultMaxBlacklistIPKeyLen,
+			LocalBanPersistEnabled:    true,
+			LocalBanPersistFile:       defaultLocalBanPersistFile,
+			LocalBanPersistWindowSec:  defaultLocalBanPersistWindowSec,
+			LocalBanPersistFlushMs:    defaultLocalBanPersistFlushMs,
 			LocalBanPersistMaxEntries: defaultLocalBanPersistMaxEntries,
-			AuthTimeoutSec:      3,
-			ShutdownTimeoutSec:  30,
+			AuthTimeoutSec:            3,
+			ShutdownTimeoutSec:        30,
 		},
 		EnableWebSocket: true,
 	}
@@ -636,11 +651,19 @@ func applyConfig(newCfg Config) error {
 	if err != nil {
 		return fmt.Errorf("trustedProxies 配置无效: %w", err)
 	}
+	parsedAdminAllowedNets, err := buildTrustedProxyNets(newCfg.AdminAllowedNetworks)
+	if err != nil {
+		return fmt.Errorf("adminAllowedNetworks 配置无效: %w", err)
+	}
 
 	cfg = newCfg
 	trustedProxyMu.Lock()
 	trustedProxyNets = parsedTrustedProxyNets
 	trustedProxyMu.Unlock()
+	adminAllowedMu.Lock()
+	adminAllowedCfg = append([]string(nil), newCfg.AdminAllowedNetworks...)
+	adminAllowedNets = parsedAdminAllowedNets
+	adminAllowedMu.Unlock()
 
 	targetURL, err := url.Parse("http://" + cfg.Backend)
 	if err != nil {
@@ -666,6 +689,7 @@ func applyConfig(newCfg Config) error {
 	upgrader.WriteBufferSize = cfg.Limits.WebSocketBufferSize
 
 	ipsetSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
+	banSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
 	connSem = make(chan struct{}, cfg.Limits.MaxConnections)
 	resetLocalRateLimiter()
 
@@ -956,12 +980,13 @@ func syncIPSetUnban(ip string) {
 	delete(ipsetCache, ipLocal)
 	ipsetMutex.Unlock()
 
-	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
-	defer cmdCancel()
-
-	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "del", "blacklist", ipLocal)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		logThrottled("ipset_del_error", 2*time.Second, "ipset del error: %v, output=%s", err, strings.TrimSpace(string(output)))
+	if err := ipsetDelBlacklistEntry(ipLocal); err != nil {
+		if !errors.Is(err, errNetlinkUnsupported) {
+			logThrottled("ipset_del_netlink_error", 2*time.Second, "ipset netlink del error: %v", err)
+		}
+		if err := runIPSetDelByCommand(ipLocal); err != nil {
+			logThrottled("ipset_del_error", 2*time.Second, "ipset del error: %v", err)
+		}
 	}
 }
 
@@ -1330,6 +1355,103 @@ func stopIPSetWorkers() {
 	ipsetQueue = nil
 }
 
+func startAdminBanWorkers() {
+	if adminBanQueue != nil {
+		return
+	}
+
+	workerCount := cfg.Limits.IpsetConcurrency / 2
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	adminBanQueue = make(chan adminBanTask, workerCount*256)
+	adminBanStop = make(chan struct{})
+
+	for i := 0; i < workerCount; i++ {
+		adminBanWG.Add(1)
+		go func() {
+			defer adminBanWG.Done()
+			for {
+				select {
+				case <-adminBanStop:
+					return
+				case task := <-adminBanQueue:
+					executeAdminBanTask(task)
+				}
+			}
+		}()
+	}
+}
+
+func stopAdminBanWorkers() {
+	if adminBanStop == nil {
+		return
+	}
+	close(adminBanStop)
+	adminBanWG.Wait()
+	adminBanStop = nil
+	adminBanQueue = nil
+}
+
+func enqueueAdminBanTask(task adminBanTask) bool {
+	if adminBanQueue == nil {
+		go executeAdminBanTask(task)
+		return true
+	}
+
+	select {
+	case adminBanQueue <- task:
+		return true
+	default:
+		return false
+	}
+}
+
+func executeAdminBanTask(task adminBanTask) {
+	if task.unban {
+		if rdb == nil {
+			logThrottled("admin_unban_redis_nil", 3*time.Second, "Redis client not initialized in admin unban")
+		} else {
+			ctx, cancel := withRedisTimeout(context.Background())
+			err := rdb.Del(ctx, "blacklist:"+task.ip, "blacklist_level:"+task.ip).Err()
+			cancel()
+			if err != nil {
+				logThrottled("admin_unban_redis_error", 3*time.Second, "Redis error in admin unban: %v", err)
+			}
+		}
+
+		removeBlacklistLocal(task.ip)
+		syncIPSetUnban(task.ip)
+		logThrottled("admin_manual_unban", 2*time.Second, "Admin manual unban: ip=%s", task.ip)
+		return
+	}
+
+	redisPersisted := false
+	if rdb == nil {
+		logThrottled("admin_ban_redis_nil", 3*time.Second, "Redis client not initialized in admin ban")
+	} else {
+		ctx, cancel := withRedisTimeout(context.Background())
+		blacklistKey := "blacklist:" + task.ip
+		levelKey := "blacklist_level:" + task.ip
+		if _, err := setBlacklistWithMaxTTL(ctx, blacklistKey, levelKey, task.duration, 3); err != nil {
+			logThrottled("admin_ban_redis_error", 3*time.Second, "Redis error in admin ban: %v", err)
+		} else {
+			redisPersisted = true
+		}
+		cancel()
+	}
+
+	cacheBlacklistLocal(task.ip, task.duration)
+	syncIPSetBan(task.ip, task.duration)
+	publishBanEvent(task.ip, task.duration, 3)
+	if !redisPersisted {
+		log.Printf("Admin ban 已走本地兜底: ip=%s, duration=%v", task.ip, task.duration)
+	}
+
+	logThrottled("admin_manual_ban", 2*time.Second, "Admin manual ban: ip=%s, duration=%v, reason=%s", task.ip, task.duration, task.reason)
+}
+
 func enqueueIPSetBan(ip string, banDuration time.Duration) {
 	banSeconds := int(banDuration.Seconds())
 	if banSeconds <= 0 {
@@ -1373,13 +1495,39 @@ func runIPSetAddFallback(task ipsetBanTask) bool {
 }
 
 func runIPSetAdd(ip string, banSeconds int) {
+	if err := ipsetAddBlacklistEntry(ip, banSeconds); err == nil {
+		return
+	} else {
+		if !errors.Is(err, errNetlinkUnsupported) {
+			logThrottled("ipset_add_netlink_error", 2*time.Second, "ipset netlink add error: %v", err)
+		}
+	}
+
+	if err := runIPSetAddByCommand(ip, banSeconds); err != nil {
+		logThrottled("ipset_add_error", 2*time.Second, "ipset add error: %v", err)
+	}
+}
+
+func runIPSetAddByCommand(ip string, banSeconds int) error {
 	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
 	defer cmdCancel()
 
 	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ip, "timeout", fmt.Sprintf("%d", banSeconds))
 	if output, err := cmd.CombinedOutput(); err != nil {
-		logThrottled("ipset_add_error", 2*time.Second, "ipset error: %v, output=%s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
 	}
+	return nil
+}
+
+func runIPSetDelByCommand(ip string) error {
+	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
+	defer cmdCancel()
+
+	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "del", "blacklist", ip)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func banIP(ctx context.Context, ip string) {
@@ -1440,6 +1588,25 @@ func banIP(ctx context.Context, ip string) {
 	cacheBlacklistLocal(ip, banDuration)
 	syncIPSetBan(ip, banDuration)
 	publishBanEvent(ip, banDuration, banLevel)
+}
+
+func triggerBanAsync(ip string) {
+	sem := banSem
+	if sem == nil {
+		go banIP(context.Background(), ip)
+		return
+	}
+
+	select {
+	case sem <- struct{}{}:
+		go func(ipLocal string) {
+			defer func() { <-sem }()
+			banIP(context.Background(), ipLocal)
+		}(ip)
+	default:
+		logThrottled("ban_async_queue_full", 2*time.Second, "异步封禁队列繁忙，退化为本地兜底: ip=%s", ip)
+		applyLocalFallbackBan(ip, "ban_async_queue_full")
+	}
 }
 
 // ---------------- 分布式连接数 ----------------
@@ -1558,13 +1725,37 @@ func isAdminAllowedIP(r *http.Request) bool {
 	if ip == nil {
 		return false
 	}
+	cfgAdminAllowedNetworks := cfg.AdminAllowedNetworks
 
-	for _, network := range cfg.AdminAllowedNetworks {
-		_, ipNet, err := net.ParseCIDR(network)
-		if err == nil && ipNet.Contains(ip) {
-			return true
+	adminAllowedMu.RLock()
+	cacheMatched := len(adminAllowedCfg) == len(cfgAdminAllowedNetworks)
+	if cacheMatched {
+		for i := range cfgAdminAllowedNetworks {
+			if adminAllowedCfg[i] != cfgAdminAllowedNetworks[i] {
+				cacheMatched = false
+				break
+			}
 		}
-		if network == ip.String() {
+	}
+
+	if cacheMatched {
+		for _, ipNet := range adminAllowedNets {
+			if ipNet.Contains(ip) {
+				adminAllowedMu.RUnlock()
+				return true
+			}
+		}
+		adminAllowedMu.RUnlock()
+		return false
+	}
+	adminAllowedMu.RUnlock()
+
+	for _, entry := range cfgAdminAllowedNetworks {
+		ipNet, err := parseTrustedProxy(entry)
+		if err != nil {
+			continue
+		}
+		if ipNet.Contains(ip) {
 			return true
 		}
 	}
@@ -1619,22 +1810,15 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 
 	ipStr := parsedIP.String()
 	if req.Duration == 0 {
-		if rdb == nil {
-			logThrottled("admin_unban_redis_nil", 3*time.Second, "Redis client not initialized in admin unban")
-		} else {
-			ctx := context.Background()
-			if err := rdb.Del(ctx, "blacklist:"+ipStr, "blacklist_level:"+ipStr).Err(); err != nil {
-				logThrottled("admin_unban_redis_error", 3*time.Second, "Redis error in admin unban: %v", err)
-			}
+		task := adminBanTask{ip: ipStr, duration: 0, reason: "manual unban", unban: true}
+		if !enqueueAdminBanTask(task) {
+			http.Error(w, "Admin queue busy", http.StatusServiceUnavailable)
+			return
 		}
-
-		removeBlacklistLocal(ipStr)
-		syncIPSetUnban(ipStr)
-		log.Printf("Admin manual unban: ip=%s", ipStr)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
-			"status":   "success",
+			"status":   "accepted",
 			"ip":       ipStr,
 			"duration": "0s",
 			"action":   "unban",
@@ -1647,38 +1831,23 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 		duration = time.Duration(req.Duration) * time.Second
 	}
 
-	redisPersisted := false
-	if rdb == nil {
-		logThrottled("admin_ban_redis_nil", 3*time.Second, "Redis client not initialized in admin ban")
-	} else {
-		ctx := context.Background()
-		blacklistKey := "blacklist:" + ipStr
-		levelKey := "blacklist_level:" + ipStr
-		if _, err := setBlacklistWithMaxTTL(ctx, blacklistKey, levelKey, duration, 3); err != nil {
-			logThrottled("admin_ban_redis_error", 3*time.Second, "Redis error in admin ban: %v", err)
-		} else {
-			redisPersisted = true
-		}
-	}
-
-	cacheBlacklistLocal(ipStr, duration)
-	syncIPSetBan(ipStr, duration)
-	publishBanEvent(ipStr, duration, 3)
-	if !redisPersisted {
-		log.Printf("Admin ban 已走本地兜底: ip=%s, duration=%v", ipStr, duration)
-	}
-
 	reason := req.Reason
 	if reason == "" {
 		reason = "manual ban"
 	}
-	log.Printf("Admin manual ban: ip=%s, duration=%v, reason=%s", ipStr, duration, reason)
+
+	task := adminBanTask{ip: ipStr, duration: duration, reason: reason, unban: false}
+	if !enqueueAdminBanTask(task) {
+		http.Error(w, "Admin queue busy", http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "success",
-		"ip":      ipStr,
+		"status":   "accepted",
+		"ip":       ipStr,
 		"duration": duration.String(),
+		"action":   "ban",
 	})
 }
 
@@ -2123,7 +2292,7 @@ func httpProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// 限流
 	if allowed, reason := allowRequestWithReason(ctx, ip); !allowed {
 		if reason == "ip" {
-			banIP(ctx, ip)
+			triggerBanAsync(ip)
 		}
 		http.Error(w, "Too many requests", 429)
 		return
@@ -2173,7 +2342,7 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Upgrade 前限流，提前拒绝恶意请求
 	if allowed, reason := allowRequestWithReason(ctx, ip); !allowed {
 		if reason == "ip" {
-			banIP(ctx, ip)
+			triggerBanAsync(ip)
 		}
 		http.Error(w, "Too many requests", 429)
 		return
@@ -2226,6 +2395,10 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	var targetConn *websocket.Conn
 	var dialErr error
+	backendDialer := *websocket.DefaultDialer
+	backendDialTimeout := 1200 * time.Millisecond
+	backendDialer.HandshakeTimeout = backendDialTimeout
+	backendDialer.NetDialContext = (&net.Dialer{Timeout: backendDialTimeout, KeepAlive: 30 * time.Second}).DialContext
 
 	const maxRetries = 3
 	const baseRetryDelay = 100 * time.Millisecond
@@ -2245,7 +2418,9 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		targetConn, _, dialErr = websocket.DefaultDialer.Dial(backendWSURL, dialHeaders)
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, backendDialTimeout)
+		targetConn, _, dialErr = backendDialer.DialContext(attemptCtx, backendWSURL, dialHeaders)
+		attemptCancel()
 		if dialErr == nil {
 			break
 		}
@@ -2282,7 +2457,7 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 			if allowed, reason := allowRequestWithReason(ctx, ip); !allowed {
 				if reason == "ip" {
-					banIP(ctx, ip)
+					triggerBanAsync(ip)
 				}
 				return fmt.Errorf("websocket message rejected by rate limit: %s", reason)
 			}
@@ -2495,6 +2670,7 @@ func main() {
 	go startIPSetSync()
 	go startIPSetCleanup()
 	startIPSetWorkers()
+	startAdminBanWorkers()
 	restoreLocalBanSnapshotFromFile()
 	startLocalBanPersistWorker()
 	startClusterMesh()
@@ -2503,12 +2679,12 @@ func main() {
 	http.HandleFunc("/admin/ban", adminBanHandler)
 
 	srv := &http.Server{
-		Addr:         ":" + port,
-		ReadTimeout:  10 * time.Second,
+		Addr:              ":" + port,
+		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	// 启动服务器
@@ -2529,6 +2705,7 @@ func main() {
 	stopLocalBanPersistWorker()
 	stopIPSetCleanup()
 	stopIPSetWorkers()
+	stopAdminBanWorkers()
 	stopClusterMesh()
 
 	// 优雅关闭，等待现有请求完成

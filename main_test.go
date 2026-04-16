@@ -769,12 +769,18 @@ func TestHeartbeat(t *testing.T) {
 
 func TestAdminBanHandler(t *testing.T) {
 	originalCfg := cfg
+	originalAdminBanQueue := adminBanQueue
+	originalAdminBanStop := adminBanStop
 	defer func() {
 		cfg = originalCfg
+		adminBanQueue = originalAdminBanQueue
+		adminBanStop = originalAdminBanStop
 	}()
 
 	cfg = defaultConfig()
 	cfg.Auth.AdminToken = "test-admin-token"
+	adminBanQueue = make(chan adminBanTask, 16)
+	adminBanStop = nil
 
 	tests := []struct {
 		name           string
@@ -935,9 +941,12 @@ func TestCalculateCumulativeBanDuration_CappedAt30Days(t *testing.T) {
 	defer s.Close()
 
 	originalRDB := rdb
+	originalRedisFastFailUntil := redisFastFailUntil.Load()
 	defer func() {
 		rdb = originalRDB
+		redisFastFailUntil.Store(originalRedisFastFailUntil)
 	}()
+	redisFastFailUntil.Store(0)
 
 	rdb = redis.NewClient(&redis.Options{Addr: s.Addr()})
 	ctx := context.Background()
