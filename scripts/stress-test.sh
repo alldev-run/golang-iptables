@@ -32,6 +32,18 @@ DIAG_STOP_ON_CODES="${DIAG_STOP_ON_CODES:-403,429,503}"
 DIAG_CONNECT_TIMEOUT_SEC="${DIAG_CONNECT_TIMEOUT_SEC:-1}"
 DIAG_MAX_TIME_SEC="${DIAG_MAX_TIME_SEC:-2}"
 WS_URL="${WS_URL:-}"
+REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6379}"
+REDIS_DB="${REDIS_DB:-14}"
+REDIS_PASSWORD="${REDIS_PASSWORD:-}"
+REDIS_BAN_QUEUE="${REDIS_BAN_QUEUE:-admin:ban}"
+REDIS_UNBAN_QUEUE="${REDIS_UNBAN_QUEUE:-admin:unban}"
+REDIS_QUEUE_TEST_TOTAL="${REDIS_QUEUE_TEST_TOTAL:-100}"
+REDIS_QUEUE_TEST_CONCURRENCY="${REDIS_QUEUE_TEST_CONCURRENCY:-10}"
+REDIS_QUEUE_TEST_MODE="${REDIS_QUEUE_TEST_MODE:-ban}"
+REDIS_QUEUE_TEST_IP_MODE="${REDIS_QUEUE_TEST_IP_MODE:-same}"
+REDIS_QUEUE_TEST_BASE_IP="${REDIS_QUEUE_TEST_BASE_IP:-198.51.100.20}"
+REDIS_QUEUE_TEST_MULTI_IP_POOL="${REDIS_QUEUE_TEST_MULTI_IP_POOL:-50}"
+REDIS_QUEUE_TEST_BAN_DURATION="${REDIS_QUEUE_TEST_BAN_DURATION:-600}"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -434,6 +446,184 @@ test_local_persistence() {
     fi
 }
 
+# 场景10: Redis 队列封禁/解封测试
+test_redis_queue() {
+    log_info "=== 场景10: Redis 队列封禁/解封测试 ==="
+
+    if ! command -v redis-cli &> /dev/null; then
+        log_error "redis-cli 未安装，请先安装: brew install redis (macOS) 或 apt install redis-tools (Linux)"
+        return 1
+    fi
+
+    if [ "$REDIS_QUEUE_TEST_MODE" != "ban" ] && [ "$REDIS_QUEUE_TEST_MODE" != "unban" ]; then
+        log_error "REDIS_QUEUE_TEST_MODE 仅支持 ban 或 unban，当前值: $REDIS_QUEUE_TEST_MODE"
+        return 1
+    fi
+    if [ "$REDIS_QUEUE_TEST_IP_MODE" != "same" ] && [ "$REDIS_QUEUE_TEST_IP_MODE" != "multi" ]; then
+        log_error "REDIS_QUEUE_TEST_IP_MODE 仅支持 same 或 multi，当前值: $REDIS_QUEUE_TEST_IP_MODE"
+        return 1
+    fi
+    if ! [[ "$REDIS_QUEUE_TEST_MULTI_IP_POOL" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "REDIS_QUEUE_TEST_MULTI_IP_POOL 必须为正整数，当前值: $REDIS_QUEUE_TEST_MULTI_IP_POOL"
+        return 1
+    fi
+
+    local redis_args
+    if [ -n "$REDIS_PASSWORD" ]; then
+        redis_args="-a $REDIS_PASSWORD"
+    fi
+    redis_args="$redis_args -h $(echo "$REDIS_ADDR" | cut -d: -f1) -p $(echo "$REDIS_ADDR" | cut -d: -f2) -n $REDIS_DB"
+
+    log_info "Redis: $REDIS_ADDR (DB: $REDIS_DB)"
+    log_info "Ban Queue: $REDIS_BAN_QUEUE"
+    log_info "Unban Queue: $REDIS_UNBAN_QUEUE"
+    log_info "总请求: $REDIS_QUEUE_TEST_TOTAL"
+    log_info "并发: $REDIS_QUEUE_TEST_CONCURRENCY"
+    log_info "模式: $REDIS_QUEUE_TEST_MODE"
+    log_info "IP模式: $REDIS_QUEUE_TEST_IP_MODE"
+    if [ "$REDIS_QUEUE_TEST_IP_MODE" = "multi" ]; then
+        log_info "多IP池: $REDIS_QUEUE_TEST_MULTI_IP_POOL"
+    fi
+
+    local queue_name
+    if [ "$REDIS_QUEUE_TEST_MODE" = "ban" ]; then
+        queue_name="$REDIS_BAN_QUEUE"
+    else
+        queue_name="$REDIS_UNBAN_QUEUE"
+    fi
+
+    log_info "目标队列: $queue_name"
+
+    local tmp_file
+    local times_file
+    local ip_file
+    local test_start_ts
+    local test_end_ts
+    local test_elapsed_sec
+    tmp_file=$(mktemp)
+    times_file=$(mktemp)
+    ip_file=$(mktemp)
+    test_start_ts=$(date +%s)
+
+    seq "$REDIS_QUEUE_TEST_TOTAL" | xargs -P"$REDIS_QUEUE_TEST_CONCURRENCY" -I{} bash -c '
+        idx="$1"
+        base_ip="$2"
+        mode="$3"
+        ban_duration="$4"
+        ip_mode="$5"
+        multi_ip_pool="${6}"
+        queue_name="$7"
+        redis_args="$8"
+
+        if [ "$ip_mode" = "multi" ]; then
+            seq_idx=$(( (idx - 1) % multi_ip_pool ))
+            octet2=$(( (seq_idx / 64516) % 253 + 1 ))
+            octet3=$(( (seq_idx / 254) % 254 + 1 ))
+            octet4=$(( seq_idx % 254 + 1 ))
+            req_ip="198.${octet2}.${octet3}.${octet4}"
+        else
+            req_ip="$base_ip"
+        fi
+
+        start_time=$(date +%s.%N)
+        if [ "$mode" = "ban" ]; then
+            payload=$(printf "{\"ip\":\"%s\",\"duration\":%s,\"reason\":\"redis-queue-test\"}" "$req_ip" "$ban_duration")
+        else
+            payload=$(printf "{\"ip\":\"%s\"}" "$req_ip")
+        fi
+
+        if result=$(redis-cli $redis_args PUBLISH "$queue_name" "$payload" 2>&1); then
+            end_time=$(date +%s.%N)
+            elapsed=$(echo "$end_time - $start_time" | bc)
+            printf "%.6f 200\n" "$elapsed"
+            printf "%s\n" "$req_ip" >> "$9"
+        else
+            end_time=$(date +%s.%N)
+            elapsed=$(echo "$end_time - $start_time" | bc)
+            printf "%.6f 000\n" "$elapsed"
+        fi
+    ' _ {} "$REDIS_QUEUE_TEST_BASE_IP" "$REDIS_QUEUE_TEST_MODE" "$REDIS_QUEUE_TEST_BAN_DURATION" "$REDIS_QUEUE_TEST_IP_MODE" "$REDIS_QUEUE_TEST_MULTI_IP_POOL" "$queue_name" "$redis_args" "$ip_file" >> "$tmp_file"
+
+    test_end_ts=$(date +%s)
+    test_elapsed_sec=$((test_end_ts - test_start_ts))
+    if [ "$test_elapsed_sec" -le 0 ]; then
+        test_elapsed_sec=1
+    fi
+
+    if [ ! -s "$tmp_file" ]; then
+        log_error "压测结果为空，请检查 Redis 连接与参数"
+        rm -f "$tmp_file" "$times_file" "$ip_file"
+        return 1
+    fi
+
+    local count
+    count=$(wc -l < "$tmp_file" | tr -d ' ')
+    awk '{print $1}' "$tmp_file" | sort -n > "$times_file"
+
+    local avg max min p95 p99 p95_index p99_index
+    avg=$(awk '{sum+=$1} END {if (NR>0) printf "%.6f", sum/NR; else print "0"}' "$tmp_file")
+    max=$(awk 'BEGIN{max=0}{if($1>max)max=$1}END{printf "%.6f", max}' "$tmp_file")
+    min=$(awk 'BEGIN{min=999999}{if($1<min)min=$1}END{if(min==999999)min=0; printf "%.6f", min}' "$tmp_file")
+
+    p95_index=$(( (count * 95 + 99) / 100 ))
+    p99_index=$(( (count * 99 + 99) / 100 ))
+    p95=$(sed -n "${p95_index}p" "$times_file")
+    p99=$(sed -n "${p99_index}p" "$times_file")
+    p95=${p95:-0}
+    p99=${p99:-0}
+
+    local ok_count fail_count success_rate
+    local total_rps success_rps failed_rps
+    ok_count=$(awk '$2=="200" {n++} END {print n+0}' "$tmp_file")
+    fail_count=$(awk '$2=="000" {n++} END {print n+0}' "$tmp_file")
+    success_rate=$(awk -v ok="$ok_count" -v total="$count" 'BEGIN {if (total>0) printf "%.4f", (ok*100.0)/total; else print "0.0000"}')
+    total_rps=$(awk -v total="$count" -v sec="$test_elapsed_sec" 'BEGIN {if (sec>0) printf "%.2f", total/sec; else print "0.00"}')
+    success_rps=$(awk -v ok="$ok_count" -v sec="$test_elapsed_sec" 'BEGIN {if (sec>0) printf "%.2f", ok/sec; else print "0.00"}')
+    failed_rps=$(awk -v fail="$fail_count" -v sec="$test_elapsed_sec" 'BEGIN {if (sec>0) printf "%.2f", fail/sec; else print "0.00"}')
+
+    echo "------ Result ------"
+    echo "Requests: $count"
+    echo "Concurrency: $REDIS_QUEUE_TEST_CONCURRENCY"
+    echo "Mode: $REDIS_QUEUE_TEST_MODE"
+    echo "IP Mode: $REDIS_QUEUE_TEST_IP_MODE"
+    echo "Queue: $queue_name"
+    echo "Avg Time: ${avg} s"
+    echo "P95 Time: ${p95} s"
+    echo "P99 Time: ${p99} s"
+    echo "Max Time: ${max} s"
+    echo "Min Time: ${min} s"
+    echo "Success (200): $ok_count"
+    echo "Failed (000): $fail_count"
+    echo "Success Rate: ${success_rate}%"
+    echo "Real Elapsed: ${test_elapsed_sec} s"
+    echo "Total RPS (real): ${total_rps}"
+    echo "Success RPS (real): ${success_rps}"
+    echo "Failed RPS (real): ${failed_rps}"
+
+    rm -f "$tmp_file" "$times_file"
+
+    log_info "等待5秒让队列消息被处理"
+    sleep 5
+
+    log_info "验证 IP 处理情况"
+    local sent_count
+    local unique_count
+    sent_count=$(wc -l < "$ip_file" | tr -d ' ')
+    unique_count=$(sort -u "$ip_file" | wc -l | tr -d ' ')
+    log_info "发送的 IP 总数: $sent_count"
+    log_info "唯一 IP 数量: $unique_count"
+
+    if [ "$REDIS_QUEUE_TEST_MODE" = "ban" ]; then
+        log_info "封禁模式：无法直接查询封禁状态，请检查服务端日志"
+        log_info "查找日志: 'redis queue ban' 和 'ipset add'"
+    else
+        log_info "解封模式：无法直接查询解封状态，请检查服务端日志"
+        log_info "查找日志: 'redis queue unban' 和 'ipset del'"
+    fi
+
+    rm -f "$ip_file"
+}
+
 diagnostic_probe() {
     local url="$1"
     local concurrency="$2"
@@ -555,6 +745,7 @@ print_usage() {
   7  本地持久化恢复测试
   8  Admin Ban/Unban 压测
   9  HTTP诊断压测
+  10 Redis队列封禁/解封测试
   all 运行所有场景
 
 环境变量:
@@ -585,6 +776,18 @@ print_usage() {
   DIAG_CONNECT_TIMEOUT_SEC 诊断请求连接超时秒 (默认: 1)
   DIAG_MAX_TIME_SEC 诊断请求总超时秒 (默认: 2)
   WS_URL            WebSocket 测试地址 (默认: 按 TARGET_URL 自动推导)
+  REDIS_ADDR        Redis 服务器地址 (默认: 127.0.0.1:6379)
+  REDIS_DB          Redis 数据库编号 (默认: 14)
+  REDIS_PASSWORD    Redis 密码 (默认: 空)
+  REDIS_BAN_QUEUE   Redis 封禁队列名 (默认: admin:ban)
+  REDIS_UNBAN_QUEUE Redis 解封队列名 (默认: admin:unban)
+  REDIS_QUEUE_TEST_TOTAL Redis 队列测试请求总数 (默认: 100)
+  REDIS_QUEUE_TEST_CONCURRENCY Redis 队列测试并发数 (默认: 10)
+  REDIS_QUEUE_TEST_MODE Redis 队列测试模式 ban|unban (默认: ban)
+  REDIS_QUEUE_TEST_IP_MODE Redis 队列测试 IP模式 same|multi (默认: same)
+  REDIS_QUEUE_TEST_BASE_IP Redis 队列测试 same 模式固定IP (默认: 198.51.100.20)
+  REDIS_QUEUE_TEST_MULTI_IP_POOL Redis 队列测试 multi 模式IP池大小 (默认: 50)
+  REDIS_QUEUE_TEST_BAN_DURATION Redis 队列测试 ban 模式时长秒 (默认: 600)
   NODE1_URL         节点1 URL (集群测试用)
   NODE2_URL         节点2 URL (集群测试用)
   NODE3_URL         节点3 URL (集群测试用)
@@ -620,10 +823,20 @@ print_usage() {
   # 诊断压测，缩短 curl 挂起时间
   DIAG_CONNECT_TIMEOUT_SEC=1 DIAG_MAX_TIME_SEC=1.5 $0 9
 
+  # Redis 队列封禁测试（单IP）
+  REDIS_QUEUE_TEST_MODE=ban REDIS_QUEUE_TEST_IP_MODE=same $0 10
+
+  # Redis 队列解封测试（多IP）
+  REDIS_QUEUE_TEST_MODE=unban REDIS_QUEUE_TEST_IP_MODE=multi REDIS_QUEUE_TEST_TOTAL=500 REDIS_QUEUE_TEST_CONCURRENCY=20 $0 10
+
+  # Redis 队列测试，自定义 Redis 地址和队列名
+  REDIS_ADDR=192.168.1.100:6379 REDIS_DB=0 REDIS_BAN_QUEUE=my:ban:queue REDIS_UNBAN_QUEUE=my:unban:queue $0 10
+
 依赖工具:
   - wrk (推荐): brew install wrk / apt install wrk
   - ab: brew install httpd / apt install apache2-utils
   - websocat (WebSocket测试): brew install websocat / apt install websocat
+  - redis-cli (Redis队列测试): brew install redis / apt install redis-tools
 EOF
 }
 
@@ -667,6 +880,9 @@ main() {
             ;;
         9)
             diagnostic_probe "$DIAG_URL" "$DIAG_CONCURRENCY" "$DIAG_DURATION"
+            ;;
+        10)
+            test_redis_queue
             ;;
 
         all)
