@@ -12,6 +12,17 @@ import (
 
 const ipsetBlacklistSetName = "blacklist"
 
+func getIPSetNameForIP(ip string) string {
+	parsedIP := net.ParseIP(strings.TrimSpace(ip))
+	if parsedIP == nil {
+		return "blacklist4"
+	}
+	if parsedIP.To4() != nil {
+		return "blacklist4"
+	}
+	return "blacklist6"
+}
+
 func ipsetAddBlacklistEntry(ip string, banSeconds int) error {
 	entry, err := newIPSetEntry(ip)
 	if err != nil {
@@ -22,7 +33,8 @@ func ipsetAddBlacklistEntry(ip string, banSeconds int) error {
 		timeout := uint32(banSeconds)
 		entry.Timeout = &timeout
 	}
-	if err := netlink.IpsetAdd(ipsetBlacklistSetName, entry); err != nil {
+	ipset := getIPSetNameForIP(ip)
+	if err := netlink.IpsetAdd(ipset, entry); err != nil {
 		if isNetlinkUnsupportedError(err) {
 			return errNetlinkUnsupported
 		}
@@ -39,7 +51,8 @@ func ipsetDelBlacklistEntry(ip string) error {
 	if err != nil {
 		return err
 	}
-	if err := netlink.IpsetDel(ipsetBlacklistSetName, entry); err != nil {
+	ipset := getIPSetNameForIP(ip)
+	if err := netlink.IpsetDel(ipset, entry); err != nil {
 		if isNetlinkUnsupportedError(err) {
 			return errNetlinkUnsupported
 		}

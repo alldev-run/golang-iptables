@@ -445,23 +445,35 @@ curl -X POST http://localhost:8080/admin/ban \
 - 自动检测操作系统（仅支持 Linux）
 - 自动检测并安装 ipset（支持 apt/yum）
 - 自动检测并安装 iptables（支持 apt/yum）
-- 自动创建 ipset blacklist 集合（hash:ip timeout 600）
-- 自动添加 iptables 规则（匹配 blacklist 集合并 DROP）
+- 自动创建 ipset 集合（blacklist4 用于 IPv4，blacklist6 用于 IPv6）
+- 自动添加 iptables/ip6tables 规则（匹配对应集合并 DROP）
 
 如果自动初始化失败，请手动执行：
 
 ```bash
-# 创建 blacklist 集合
-sudo ipset create blacklist hash:ip timeout 600
+# 创建 IPv4 blacklist4 集合
+sudo ipset create blacklist4 hash:ip family inet timeout 600
 
-# 查看 blacklist 集合
-sudo ipset list blacklist
+# 创建 IPv6 blacklist6 集合
+sudo ipset create blacklist6 hash:ip family inet6 timeout 600
 
-# 添加 iptables 规则
-sudo iptables -I INPUT -m set --match-set blacklist src -j DROP
+# 查看 IPv4 集合
+sudo ipset list blacklist4
 
-# 删除 IP
-sudo ipset del blacklist 1.2.3.4
+# 查看 IPv6 集合
+sudo ipset list blacklist6
+
+# 添加 iptables 规则（IPv4）
+sudo iptables -I INPUT -m set --match-set blacklist4 src -j DROP
+
+# 添加 ip6tables 规则（IPv6）
+sudo ip6tables -I INPUT -m set --match-set blacklist6 src -j DROP
+
+# 删除 IPv4 IP
+sudo ipset del blacklist4 1.2.3.4
+
+# 删除 IPv6 IP
+sudo ipset del blacklist6 2001:db8::1
 ```
 
 ## 注意事项

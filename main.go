@@ -2004,7 +2004,8 @@ func runIPSetAddByCommand(ip string, banSeconds int) error {
 	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
 	defer cmdCancel()
 
-	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", "blacklist", ip, "timeout", fmt.Sprintf("%d", banSeconds))
+	ipset := getIPSetName(ip)
+	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", ipset, ip, "timeout", fmt.Sprintf("%d", banSeconds))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
 	}
@@ -2015,7 +2016,8 @@ func runIPSetDelByCommand(ip string) error {
 	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
 	defer cmdCancel()
 
-	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "del", "blacklist", ip)
+	ipset := getIPSetName(ip)
+	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "del", ipset, ip)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
 	}
@@ -3073,55 +3075,99 @@ func ensureCommand(cmd string, installCmds []string) error {
 
 // 创建 ipset blacklist 集合
 func createIpsetBlacklist() error {
-	// 检查集合是否已存在
-	_, err := exec.Command("ipset", "list", "blacklist").CombinedOutput()
-	if err == nil {
-		log.Println("ipset blacklist 集合已存在")
-		return nil
+	// 检查并创建 IPv4 集合
+	_, err := exec.Command("ipset", "list", "blacklist4").CombinedOutput()
+	if err != nil {
+		log.Println("创建 ipset blacklist4 集合 (IPv4)...")
+		cmd := exec.Command(
+			"sudo", "ipset", "create", "blacklist4", "hash:ip",
+			"family", "inet",
+			"timeout", "600",
+			"hashsize", strconv.Itoa(cfg.Limits.IPSetHashSize),
+			"maxelem", strconv.Itoa(cfg.Limits.IPSetMaxElem),
+		)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("创建 ipset blacklist4 失败: %s", string(output))
+		}
+		log.Printf("ipset blacklist4 集合创建成功: hashsize=%d maxelem=%d", cfg.Limits.IPSetHashSize, cfg.Limits.IPSetMaxElem)
+	} else {
+		log.Println("ipset blacklist4 集合已存在 (IPv4)")
 	}
 
-	log.Println("创建 ipset blacklist 集合...")
-
-	// 创建集合
-	cmd := exec.Command(
-		"sudo", "ipset", "create", "blacklist", "hash:ip",
-		"family", "inet",
-		"timeout", "600",
-		"hashsize", strconv.Itoa(cfg.Limits.IPSetHashSize),
-		"maxelem", strconv.Itoa(cfg.Limits.IPSetMaxElem),
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("创建 ipset 失败: %s", string(output))
+	// 检查并创建 IPv6 集合
+	_, err = exec.Command("ipset", "list", "blacklist6").CombinedOutput()
+	if err != nil {
+		log.Println("创建 ipset blacklist6 集合 (IPv6)...")
+		cmd := exec.Command(
+			"sudo", "ipset", "create", "blacklist6", "hash:ip",
+			"family", "inet6",
+			"timeout", "600",
+			"hashsize", strconv.Itoa(cfg.Limits.IPSetHashSize),
+			"maxelem", strconv.Itoa(cfg.Limits.IPSetMaxElem),
+		)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("创建 ipset blacklist6 失败: %s", string(output))
+		}
+		log.Printf("ipset blacklist6 集合创建成功: hashsize=%d maxelem=%d", cfg.Limits.IPSetHashSize, cfg.Limits.IPSetMaxElem)
+	} else {
+		log.Println("ipset blacklist6 集合已存在 (IPv6)")
 	}
 
-	log.Printf("ipset blacklist 集合创建成功: hashsize=%d maxelem=%d", cfg.Limits.IPSetHashSize, cfg.Limits.IPSetMaxElem)
 	return nil
+}
+
+// getIPSetName 根据 IP 版本返回对应的 ipset 名称
+func getIPSetName(ip string) string {
+	parsedIP := net.ParseIP(strings.TrimSpace(ip))
+	if parsedIP == nil {
+		return "blacklist4" // 默认返回 IPv4
+	}
+	if parsedIP.To4() != nil {
+		return "blacklist4" // IPv4
+	}
+	return "blacklist6" // IPv6
 }
 
 // 添加 iptables 规则
 func addIptablesRule() error {
-	// 检查规则是否已存在
+	// 添加 IPv4 iptables 规则
 	output, err := exec.Command("sudo", "iptables", "-L", "INPUT", "-n", "--line-numbers").CombinedOutput()
 	if err != nil {
 		log.Printf("获取 iptables 规则失败: %s", string(output))
 		return err
 	}
 
-	// 检查是否已存在 blacklist 规则
-	if strings.Contains(string(output), "match-set blacklist") {
-		log.Println("iptables 规则已存在")
-		return nil
+	// 检查是否已存在 blacklist4 规则
+	if !strings.Contains(string(output), "match-set blacklist4") {
+		log.Println("添加 iptables 规则 (IPv4)...")
+		cmd := exec.Command("sudo", "iptables", "-I", "INPUT", "-m", "set", "--match-set", "blacklist4", "src", "-j", "DROP")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("添加 iptables 规则失败: %s", string(output))
+		}
+		log.Println("iptables 规则添加成功 (IPv4)")
+	} else {
+		log.Println("iptables 规则已存在 (IPv4)")
 	}
 
-	log.Println("添加 iptables 规则...")
-
-	// 添加规则
-	cmd := exec.Command("sudo", "iptables", "-I", "INPUT", "-m", "set", "--match-set", "blacklist", "src", "-j", "DROP")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("添加 iptables 规则失败: %s", string(output))
+	// 添加 IPv6 ip6tables 规则
+	output, err = exec.Command("sudo", "ip6tables", "-L", "INPUT", "-n", "--line-numbers").CombinedOutput()
+	if err != nil {
+		log.Printf("获取 ip6tables 规则失败: %s", string(output))
+		return err
 	}
 
-	log.Println("iptables 规则添加成功")
+	// 检查是否已存在 blacklist6 规则
+	if !strings.Contains(string(output), "match-set blacklist6") {
+		log.Println("添加 ip6tables 规则 (IPv6)...")
+		cmd := exec.Command("sudo", "ip6tables", "-I", "INPUT", "-m", "set", "--match-set", "blacklist6", "src", "-j", "DROP")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("添加 ip6tables 规则失败: %s", string(output))
+		}
+		log.Println("ip6tables 规则添加成功 (IPv6)")
+	} else {
+		log.Println("ip6tables 规则已存在 (IPv6)")
+	}
+
 	return nil
 }
 
