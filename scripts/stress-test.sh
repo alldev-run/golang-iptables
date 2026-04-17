@@ -24,6 +24,7 @@ ADMIN_BENCH_SUCCESS_RPS_TARGET="${ADMIN_BENCH_SUCCESS_RPS_TARGET:-1000}"
 ADMIN_BENCH_TOKEN_HEADER="${ADMIN_BENCH_TOKEN_HEADER:-authorization}"
 ADMIN_BENCH_CONNECT_TIMEOUT_SEC="${ADMIN_BENCH_CONNECT_TIMEOUT_SEC:-1}"
 ADMIN_BENCH_MAX_TIME_SEC="${ADMIN_BENCH_MAX_TIME_SEC:-3}"
+ADMIN_BENCH_IP_VERSION="${ADMIN_BENCH_IP_VERSION:-ipv4}"
 DIAG_URL="${DIAG_URL:-${TARGET_URL}/}"
 DIAG_CONCURRENCY="${DIAG_CONCURRENCY:-100}"
 DIAG_DURATION="${DIAG_DURATION:-30}"
@@ -44,6 +45,7 @@ REDIS_QUEUE_TEST_IP_MODE="${REDIS_QUEUE_TEST_IP_MODE:-same}"
 REDIS_QUEUE_TEST_BASE_IP="${REDIS_QUEUE_TEST_BASE_IP:-198.51.100.20}"
 REDIS_QUEUE_TEST_MULTI_IP_POOL="${REDIS_QUEUE_TEST_MULTI_IP_POOL:-50}"
 REDIS_QUEUE_TEST_BAN_DURATION="${REDIS_QUEUE_TEST_BAN_DURATION:-600}"
+REDIS_QUEUE_TEST_IP_VERSION="${REDIS_QUEUE_TEST_IP_VERSION:-ipv4}"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -136,13 +138,24 @@ test_admin_ban_benchmark() {
         token_header="$9"
         connect_timeout_sec="${10}"
         max_time_sec="${11}"
+        ip_version="${12}"
 
         if [ "$ip_mode" = "multi" ]; then
             seq_idx=$(( (idx - 1) % multi_ip_pool ))
-            octet2=$(( (seq_idx / 64516) % 253 + 1 ))
-            octet3=$(( (seq_idx / 254) % 254 + 1 ))
-            octet4=$(( seq_idx % 254 + 1 ))
-            req_ip="198.${octet2}.${octet3}.${octet4}"
+            if [ "$ip_version" = "ipv6" ]; then
+                # IPv6 multi IP generation
+                h1=$(( 0x2001 + (seq_idx / 65536) % 0x1000 ))
+                h2=$(( 0x0db8 ))
+                h3=$(( (seq_idx / 256) % 65536 ))
+                h4=$(( seq_idx % 65536 ))
+                req_ip="${h1}:${h2}:${h3}:${h4}::1"
+            else
+                # IPv4 multi IP generation
+                octet2=$(( (seq_idx / 64516) % 253 + 1 ))
+                octet3=$(( (seq_idx / 254) % 254 + 1 ))
+                octet4=$(( seq_idx % 254 + 1 ))
+                req_ip="198.${octet2}.${octet3}.${octet4}"
+            fi
         else
             req_ip="$base_ip"
         fi
@@ -181,7 +194,7 @@ test_admin_ban_benchmark() {
         else
             printf "%s\n" "$result"
         fi
-    ' _ {} "$ADMIN_BENCH_BASE_IP" "$ADMIN_BENCH_MODE" "$ADMIN_BENCH_BAN_DURATION" "$ADMIN_BAN_URL" "$ADMIN_TOKEN" "$ADMIN_BENCH_IP_MODE" "$ADMIN_BENCH_MULTI_IP_POOL" "$token_header" "$connect_timeout_sec" "$max_time_sec" >> "$tmp_file"
+    ' _ {} "$ADMIN_BENCH_BASE_IP" "$ADMIN_BENCH_MODE" "$ADMIN_BENCH_BAN_DURATION" "$ADMIN_BAN_URL" "$ADMIN_TOKEN" "$ADMIN_BENCH_IP_MODE" "$ADMIN_BENCH_MULTI_IP_POOL" "$token_header" "$connect_timeout_sec" "$max_time_sec" "$ADMIN_BENCH_IP_VERSION" >> "$tmp_file"
 
     bench_end_ts=$(date +%s)
     bench_elapsed_sec=$((bench_end_ts - bench_start_ts))
@@ -514,13 +527,24 @@ test_redis_queue() {
         multi_ip_pool="${6}"
         queue_name="$7"
         redis_args="$8"
+        ip_version="${10}"
 
         if [ "$ip_mode" = "multi" ]; then
             seq_idx=$(( (idx - 1) % multi_ip_pool ))
-            octet2=$(( (seq_idx / 64516) % 253 + 1 ))
-            octet3=$(( (seq_idx / 254) % 254 + 1 ))
-            octet4=$(( seq_idx % 254 + 1 ))
-            req_ip="198.${octet2}.${octet3}.${octet4}"
+            if [ "$ip_version" = "ipv6" ]; then
+                # IPv6 multi IP generation
+                h1=$(( 0x2001 + (seq_idx / 65536) % 0x1000 ))
+                h2=$(( 0x0db8 ))
+                h3=$(( (seq_idx / 256) % 65536 ))
+                h4=$(( seq_idx % 65536 ))
+                req_ip="${h1}:${h2}:${h3}:${h4}::1"
+            else
+                # IPv4 multi IP generation
+                octet2=$(( (seq_idx / 64516) % 253 + 1 ))
+                octet3=$(( (seq_idx / 254) % 254 + 1 ))
+                octet4=$(( seq_idx % 254 + 1 ))
+                req_ip="198.${octet2}.${octet3}.${octet4}"
+            fi
         else
             req_ip="$base_ip"
         fi
@@ -542,7 +566,7 @@ test_redis_queue() {
             elapsed=$(echo "$end_time - $start_time" | bc)
             printf "%.6f 000\n" "$elapsed"
         fi
-    ' _ {} "$REDIS_QUEUE_TEST_BASE_IP" "$REDIS_QUEUE_TEST_MODE" "$REDIS_QUEUE_TEST_BAN_DURATION" "$REDIS_QUEUE_TEST_IP_MODE" "$REDIS_QUEUE_TEST_MULTI_IP_POOL" "$queue_name" "$redis_args" "$ip_file" >> "$tmp_file"
+    ' _ {} "$REDIS_QUEUE_TEST_BASE_IP" "$REDIS_QUEUE_TEST_MODE" "$REDIS_QUEUE_TEST_BAN_DURATION" "$REDIS_QUEUE_TEST_IP_MODE" "$REDIS_QUEUE_TEST_MULTI_IP_POOL" "$queue_name" "$redis_args" "$ip_file" "$REDIS_QUEUE_TEST_IP_VERSION" >> "$tmp_file"
 
     test_end_ts=$(date +%s)
     test_elapsed_sec=$((test_end_ts - test_start_ts))
@@ -762,6 +786,7 @@ print_usage() {
   ADMIN_BENCH_BASE_IP same 模式固定IP (默认: 198.51.100.10)
   ADMIN_BENCH_MULTI_IP_POOL multi 模式IP池大小 (默认: 200)
   ADMIN_BENCH_BAN_DURATION ban 模式时长秒 (默认: 600)
+  ADMIN_BENCH_IP_VERSION IP版本 ipv4|ipv6 (默认: ipv4)
   ADMIN_BENCH_SUCCESS_RATE_THRESHOLD 2xx成功率阈值百分比 (默认: 99.90)
   ADMIN_BENCH_FAIL_ON_THRESHOLD 低于阈值时是否返回非零 true|false (默认: false)
   ADMIN_BENCH_SUCCESS_RPS_TARGET 成功吞吐目标(req/s)，用于达标提示 (默认: 1000)
@@ -788,6 +813,7 @@ print_usage() {
   REDIS_QUEUE_TEST_BASE_IP Redis 队列测试 same 模式固定IP (默认: 198.51.100.20)
   REDIS_QUEUE_TEST_MULTI_IP_POOL Redis 队列测试 multi 模式IP池大小 (默认: 50)
   REDIS_QUEUE_TEST_BAN_DURATION Redis 队列测试 ban 模式时长秒 (默认: 600)
+  REDIS_QUEUE_TEST_IP_VERSION Redis 队列测试 IP版本 ipv4|ipv6 (默认: ipv4)
   NODE1_URL         节点1 URL (集群测试用)
   NODE2_URL         节点2 URL (集群测试用)
   NODE3_URL         节点3 URL (集群测试用)
@@ -807,6 +833,12 @@ print_usage() {
 
   # admin ban 压测（多IP）
   ADMIN_BENCH_MODE=ban ADMIN_BENCH_IP_MODE=multi ADMIN_BENCH_TOTAL=20000 ADMIN_BENCH_CONCURRENCY=200 $0 8
+
+  # admin ban 压测（IPv6 多IP）
+  ADMIN_BENCH_MODE=ban ADMIN_BENCH_IP_MODE=multi ADMIN_BENCH_IP_VERSION=ipv6 ADMIN_BENCH_BASE_IP=2001:db8::1 $0 8
+
+  # Redis 队列测试（IPv6）
+  REDIS_QUEUE_TEST_MODE=ban REDIS_QUEUE_TEST_IP_MODE=multi REDIS_QUEUE_TEST_IP_VERSION=ipv6 REDIS_QUEUE_TEST_BASE_IP=2001:db8::1 $0 10
 
   # admin 压测使用 X-Admin-Token 头
   ADMIN_BENCH_TOKEN_HEADER=x-admin-token $0 8
