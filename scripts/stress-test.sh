@@ -16,9 +16,11 @@ ADMIN_BENCH_CONCURRENCY="${ADMIN_BENCH_CONCURRENCY:-100}"
 ADMIN_BENCH_MODE="${ADMIN_BENCH_MODE:-unban}"
 ADMIN_BENCH_IP_MODE="${ADMIN_BENCH_IP_MODE:-same}"
 ADMIN_BENCH_BASE_IP="${ADMIN_BENCH_BASE_IP:-198.51.100.10}"
+ADMIN_BENCH_MULTI_IP_POOL="${ADMIN_BENCH_MULTI_IP_POOL:-200}"
 ADMIN_BENCH_BAN_DURATION="${ADMIN_BENCH_BAN_DURATION:-600}"
 ADMIN_BENCH_SUCCESS_RATE_THRESHOLD="${ADMIN_BENCH_SUCCESS_RATE_THRESHOLD:-99.90}"
 ADMIN_BENCH_FAIL_ON_THRESHOLD="${ADMIN_BENCH_FAIL_ON_THRESHOLD:-false}"
+ADMIN_BENCH_SUCCESS_RPS_TARGET="${ADMIN_BENCH_SUCCESS_RPS_TARGET:-1000}"
 ADMIN_BENCH_TOKEN_HEADER="${ADMIN_BENCH_TOKEN_HEADER:-authorization}"
 ADMIN_BENCH_CONNECT_TIMEOUT_SEC="${ADMIN_BENCH_CONNECT_TIMEOUT_SEC:-1}"
 ADMIN_BENCH_MAX_TIME_SEC="${ADMIN_BENCH_MAX_TIME_SEC:-3}"
@@ -72,6 +74,10 @@ test_admin_ban_benchmark() {
         log_error "ADMIN_BENCH_IP_MODE 仅支持 same 或 multi，当前值: $ADMIN_BENCH_IP_MODE"
         return 1
     fi
+    if ! [[ "$ADMIN_BENCH_MULTI_IP_POOL" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "ADMIN_BENCH_MULTI_IP_POOL 必须为正整数，当前值: $ADMIN_BENCH_MULTI_IP_POOL"
+        return 1
+    fi
     if [ "$ADMIN_BENCH_TOKEN_HEADER" != "authorization" ] && [ "$ADMIN_BENCH_TOKEN_HEADER" != "x-admin-token" ]; then
         log_error "ADMIN_BENCH_TOKEN_HEADER 仅支持 authorization 或 x-admin-token，当前值: $ADMIN_BENCH_TOKEN_HEADER"
         return 1
@@ -82,6 +88,12 @@ test_admin_ban_benchmark() {
     log_info "并发: $ADMIN_BENCH_CONCURRENCY"
     log_info "模式: $ADMIN_BENCH_MODE"
     log_info "IP模式: $ADMIN_BENCH_IP_MODE"
+    if [ "$ADMIN_BENCH_IP_MODE" = "multi" ]; then
+        log_info "多IP池: $ADMIN_BENCH_MULTI_IP_POOL"
+        if [ "$ADMIN_BENCH_MULTI_IP_POOL" -lt "$ADMIN_BENCH_TOTAL" ]; then
+            log_warn "多IP池小于总请求，将出现重复IP（非最坏情况）"
+        fi
+    fi
     log_info "TokenHeader: $ADMIN_BENCH_TOKEN_HEADER"
     log_info "CurlTimeout: connect=${ADMIN_BENCH_CONNECT_TIMEOUT_SEC}s total=${ADMIN_BENCH_MAX_TIME_SEC}s"
 
@@ -90,11 +102,15 @@ test_admin_ban_benchmark() {
     local token_header
     local connect_timeout_sec
     local max_time_sec
+    local bench_start_ts
+    local bench_end_ts
+    local bench_elapsed_sec
     tmp_file=$(mktemp)
     times_file=$(mktemp)
     token_header="$ADMIN_BENCH_TOKEN_HEADER"
     connect_timeout_sec="$ADMIN_BENCH_CONNECT_TIMEOUT_SEC"
     max_time_sec="$ADMIN_BENCH_MAX_TIME_SEC"
+    bench_start_ts=$(date +%s)
 
     seq "$ADMIN_BENCH_TOTAL" | xargs -P"$ADMIN_BENCH_CONCURRENCY" -I{} bash -c '
         idx="$1"
@@ -104,13 +120,17 @@ test_admin_ban_benchmark() {
         target_url="$5"
         token="$6"
         ip_mode="$7"
-        token_header="$8"
-        connect_timeout_sec="$9"
-        max_time_sec="${10}"
+        multi_ip_pool="${8}"
+        token_header="$9"
+        connect_timeout_sec="${10}"
+        max_time_sec="${11}"
 
         if [ "$ip_mode" = "multi" ]; then
-            octet=$(( (idx - 1) % 200 + 1 ))
-            req_ip="198.51.100.${octet}"
+            seq_idx=$(( (idx - 1) % multi_ip_pool ))
+            octet2=$(( (seq_idx / 64516) % 253 + 1 ))
+            octet3=$(( (seq_idx / 254) % 254 + 1 ))
+            octet4=$(( seq_idx % 254 + 1 ))
+            req_ip="198.${octet2}.${octet3}.${octet4}"
         else
             req_ip="$base_ip"
         fi
@@ -149,7 +169,13 @@ test_admin_ban_benchmark() {
         else
             printf "%s\n" "$result"
         fi
-    ' _ {} "$ADMIN_BENCH_BASE_IP" "$ADMIN_BENCH_MODE" "$ADMIN_BENCH_BAN_DURATION" "$ADMIN_BAN_URL" "$ADMIN_TOKEN" "$ADMIN_BENCH_IP_MODE" "$token_header" "$connect_timeout_sec" "$max_time_sec" >> "$tmp_file"
+    ' _ {} "$ADMIN_BENCH_BASE_IP" "$ADMIN_BENCH_MODE" "$ADMIN_BENCH_BAN_DURATION" "$ADMIN_BAN_URL" "$ADMIN_TOKEN" "$ADMIN_BENCH_IP_MODE" "$ADMIN_BENCH_MULTI_IP_POOL" "$token_header" "$connect_timeout_sec" "$max_time_sec" >> "$tmp_file"
+
+    bench_end_ts=$(date +%s)
+    bench_elapsed_sec=$((bench_end_ts - bench_start_ts))
+    if [ "$bench_elapsed_sec" -le 0 ]; then
+        bench_elapsed_sec=1
+    fi
 
     if [ ! -s "$tmp_file" ]; then
         log_error "压测结果为空，请检查目标服务与参数"
@@ -174,11 +200,16 @@ test_admin_ban_benchmark() {
     p99=${p99:-0}
 
     local ok_count busy_count unauthorized_count network_fail_count success_rate
+    local failed_count total_rps success_rps failed_rps
     ok_count=$(awk '$2 ~ /^2[0-9][0-9]$/ {n++} END {print n+0}' "$tmp_file")
     busy_count=$(awk '$2=="503" {n++} END {print n+0}' "$tmp_file")
     unauthorized_count=$(awk '$2=="401" {n++} END {print n+0}' "$tmp_file")
     network_fail_count=$(awk '$2=="000" {n++} END {print n+0}' "$tmp_file")
     success_rate=$(awk -v ok="$ok_count" -v total="$count" 'BEGIN {if (total>0) printf "%.4f", (ok*100.0)/total; else print "0.0000"}')
+    failed_count=$((count - ok_count))
+    total_rps=$(awk -v total="$count" -v sec="$bench_elapsed_sec" 'BEGIN {if (sec>0) printf "%.2f", total/sec; else print "0.00"}')
+    success_rps=$(awk -v ok="$ok_count" -v sec="$bench_elapsed_sec" 'BEGIN {if (sec>0) printf "%.2f", ok/sec; else print "0.00"}')
+    failed_rps=$(awk -v fail="$failed_count" -v sec="$bench_elapsed_sec" 'BEGIN {if (sec>0) printf "%.2f", fail/sec; else print "0.00"}')
 
     echo "------ Result ------"
     echo "Requests: $count"
@@ -195,6 +226,16 @@ test_admin_ban_benchmark() {
     echo "HTTP 401: $unauthorized_count"
     echo "HTTP 000: $network_fail_count"
     echo "Success Rate (2xx): ${success_rate}%"
+    echo "Real Elapsed: ${bench_elapsed_sec} s"
+    echo "Total RPS (real): ${total_rps}"
+    echo "Success RPS (real): ${success_rps}"
+    echo "Failed RPS (real): ${failed_rps}"
+
+    if awk -v rps="$success_rps" -v target="$ADMIN_BENCH_SUCCESS_RPS_TARGET" 'BEGIN {exit !(rps+0 >= target+0)}'; then
+        log_info "吞吐目标通过: Success RPS=${success_rps} (目标 ${ADMIN_BENCH_SUCCESS_RPS_TARGET})"
+    else
+        log_warn "吞吐目标未达标: Success RPS=${success_rps} (目标 ${ADMIN_BENCH_SUCCESS_RPS_TARGET})"
+    fi
 
     echo "------ HTTP Code Distribution ------"
     awk '{codes[$2]++} END {for (code in codes) printf "%s %d\n", code, codes[code]}' "$tmp_file" | sort -n
@@ -528,9 +569,11 @@ print_usage() {
   ADMIN_BENCH_MODE  压测模式 ban|unban (默认: unban)
   ADMIN_BENCH_IP_MODE IP模式 same|multi (默认: same)
   ADMIN_BENCH_BASE_IP same 模式固定IP (默认: 198.51.100.10)
+  ADMIN_BENCH_MULTI_IP_POOL multi 模式IP池大小 (默认: 200)
   ADMIN_BENCH_BAN_DURATION ban 模式时长秒 (默认: 600)
   ADMIN_BENCH_SUCCESS_RATE_THRESHOLD 2xx成功率阈值百分比 (默认: 99.90)
   ADMIN_BENCH_FAIL_ON_THRESHOLD 低于阈值时是否返回非零 true|false (默认: false)
+  ADMIN_BENCH_SUCCESS_RPS_TARGET 成功吞吐目标(req/s)，用于达标提示 (默认: 1000)
   ADMIN_BENCH_TOKEN_HEADER admin 鉴权头 authorization|x-admin-token (默认: authorization)
   ADMIN_BENCH_CONNECT_TIMEOUT_SEC admin 压测连接超时秒 (默认: 1)
   ADMIN_BENCH_MAX_TIME_SEC admin 压测总超时秒 (默认: 3)

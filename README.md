@@ -39,6 +39,8 @@ go mod download
     "addr": "127.0.0.1:6379",
     "db": 14,
     "password": "",
+    "adminBanQueue": "",
+    "adminUnbanQueue": "",
     "opTimeoutMs": 500,
     "fastFailWindowMs": 2000,
     "dialTimeoutMs": 500,
@@ -89,6 +91,8 @@ go mod download
     "webSocketMaxLifetimeSec": 1800,
     "ipsetConcurrency": 20,
     "ipsetTimeoutSec": 3,
+    "ipsetHashSize": 262144,
+    "ipsetMaxElem": 1048576,
     "machineHealthCheckSec": 2,
     "machineMaxCPUPercent": 92,
     "machineMaxLoadPerCpu": 1.5,
@@ -116,6 +120,8 @@ go mod download
 - `redis.addr`：Redis 服务器地址
 - `redis.db`：Redis 数据库编号
 - `redis.password`：Redis 密码（无密码留空）
+- `redis.adminBanQueue`：Redis 订阅队列名（封禁队列，留空表示禁用）
+- `redis.adminUnbanQueue`：Redis 订阅队列名（解封队列，留空表示禁用）
 - `redis.opTimeoutMs`：Redis 操作超时（毫秒，默认 `500`）
 - `redis.fastFailWindowMs`：Redis 快速失败窗口（毫秒，默认 `2000`）
 - `redis.dialTimeoutMs`：Redis 建连超时（毫秒，默认 `500`）
@@ -150,8 +156,10 @@ go mod download
 - `limits.maxBodySizeMB`：HTTP 请求体最大大小（MB，默认 10）
 - `limits.webSocketBufferSize`：WebSocket 缓冲区大小（bytes，默认 1048576）
 - `limits.webSocketMaxLifetimeSec`：WebSocket 最大连接生命周期（秒，默认 7200）
-- `limits.ipsetConcurrency`：ipset 并发数（默认 10）
+- `limits.ipsetConcurrency`：ipset 并发数（默认 10），同时用于计算 admin ban 处理并发和队列容量（见下方“队列大小控制”）
 - `limits.ipsetTimeoutSec`：ipset 命令超时（秒，默认 5）
+- `limits.ipsetHashSize`：ipset `blacklist` 集合 `hashsize`（默认 262144）
+- `limits.ipsetMaxElem`：ipset `blacklist` 集合 `maxelem`（默认 1048576）
 - `limits.ipsetSyncIntervalSec`：ipset 从 Redis 同步间隔（秒，默认 30，0 表示不同步）
 - `limits.ipsetCacheMaxEntries`：ipset 本地缓存最大条目数（默认 200000，用于控制内存上限）
 - `limits.ipsetSyncMaxPerRound`：每轮 Redis→ipset 最大同步条目数（默认 50000，防止单轮同步过载）
@@ -169,6 +177,21 @@ go mod download
 - `limits.machineRecoveryThreshold`：连续恢复次数关闭熔断（默认 3）
 - `limits.authTimeoutSec`：认证超时（保留字段，当前版本未使用）
 - `limits.shutdownTimeoutSec`：优雅关闭超时（秒，默认 30）
+
+### 队列大小控制（admin ban 相关）
+
+`/admin/ban` 采用异步队列模型，队列容量由 `limits.ipsetConcurrency` 间接控制：
+
+- admin worker 数：`max(1, floor(ipsetConcurrency / 2))`
+- 主任务队列 `adminBanQueue`：`workerCount * 1024`
+- 溢出队列 `adminBanOverflowQueue`：`workerCount * 2048`
+- fallback ipset 队列 `adminFallbackIPSetQueue`：`workerCount * 2048`
+
+调优建议：
+
+- 如果压测中看到大量溢出日志（`admin_queue_overflow_*`），优先增大 `limits.ipsetConcurrency`
+- `ipsetConcurrency` 越大，worker 与队列越大，但会增加 CPU/内存占用
+- 如果出现 `Hash is full, cannot add more elements`，请增大 `limits.ipsetMaxElem`（必要时同步增大 `limits.ipsetHashSize`）
 
 ## 启动
 
@@ -346,6 +369,40 @@ fetch('http://localhost:8080/api/test')
 **Redis 故障兜底：**
 - 当 Redis 不可用或写入失败时，`/admin/ban` 仍会执行本地封禁（本地缓存 + ipset）
 - Redis 恢复后，后续封禁会继续写入 Redis
+
+**队列与回退路径（高压场景）：**
+- 请求优先进入 `adminBanQueue` 异步处理
+- 主队列满时，先做本地兜底，再进入 `adminBanOverflowQueue` 批量回灌
+- 溢出持续拥堵时，任务会走受限并发的直接执行回退
+- fallback 中的 ipset 更新通过 `adminFallbackIPSetQueue` 异步执行，避免请求线程被 ipset 慢路径阻塞
+
+**Redis 订阅队列（可选）：**
+- 可通过 `redis.adminBanQueue` / `redis.adminUnbanQueue` 配置两个独立订阅队列
+- 服务启动后会订阅这两个队列，并将消息转为 `adminBanTask` 走同一套异步处理链路
+- 两个队列名不能相同（配置校验会拒绝）
+
+封禁队列消息格式（`redis.adminBanQueue`）：
+
+```json
+{
+  "ip": "1.2.3.4",
+  "duration": 600,
+  "reason": "from redis queue"
+}
+```
+
+- 也支持纯字符串消息（仅 IP），例如：`1.2.3.4`
+- `duration` 单位为秒；缺省时默认 `600`
+
+解封队列消息格式（`redis.adminUnbanQueue`）：
+
+```json
+{
+  "ip": "1.2.3.4"
+}
+```
+
+- 也支持纯字符串消息（仅 IP），例如：`1.2.3.4`
 
 **请求参数（JSON）：**
 ```json

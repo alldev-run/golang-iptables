@@ -31,6 +31,8 @@ import (
 
 const (
 	defaultMaxIPSetCacheEntries      = 200000
+	defaultIPSetHashSize             = 262144
+	defaultIPSetMaxElem              = 1048576
 	defaultMaxRedisSyncPerRound      = 50000
 	defaultMaxBlacklistIPKeyLen      = 64
 	redisSyncMinPTTL                 = 200 * time.Millisecond
@@ -58,6 +60,9 @@ var (
 
 	// Redis
 	rdb *redis.Client
+	redisAdminQueueMu   sync.Mutex
+	redisAdminQueueStop chan struct{}
+	redisAdminQueueWG   sync.WaitGroup
 
 	// ipset 去重锁
 	ipsetMutex    sync.Mutex
@@ -65,9 +70,15 @@ var (
 	ipsetQueue    chan ipsetBanTask
 	ipsetStop     chan struct{}
 	ipsetWG       sync.WaitGroup
-	adminBanQueue chan adminBanTask
-	adminBanStop  chan struct{}
-	adminBanWG    sync.WaitGroup
+	adminBanQueue         chan adminBanTask
+	adminBanStop          chan struct{}
+	adminBanWG            sync.WaitGroup
+	adminBanOverflowQueue chan adminBanTask
+	adminBanOverflowStop  chan struct{}
+	adminBanOverflowWG    sync.WaitGroup
+	adminFallbackIPSetQueue chan adminFallbackIPSetTask
+	adminFallbackIPSetStop  chan struct{}
+	adminFallbackIPSetWG    sync.WaitGroup
 
 	blacklistCacheMu    sync.RWMutex
 	blacklistHitCache   = make(map[string]time.Time)
@@ -82,6 +93,10 @@ var (
 	redisSyncCursorMu   sync.Mutex
 	redisSyncCursor     uint64
 	redisFastFailUntil  atomic.Int64
+	adminBanOverflowInTotal     atomic.Uint64
+	adminBanOverflowDirectTotal atomic.Uint64
+	adminFallbackIPSetQueuedTotal  atomic.Uint64
+	adminFallbackIPSetDroppedTotal atomic.Uint64
 
 	blacklistSetMaxTTLScript = redis.NewScript(`
 local ttl = redis.call("PTTL", KEYS[1])
@@ -172,6 +187,8 @@ type RedisConfig struct {
 	Addr             string `json:"addr"`
 	DB               int    `json:"db"`
 	Password         string `json:"password"`
+	AdminBanQueue    string `json:"adminBanQueue"`
+	AdminUnbanQueue  string `json:"adminUnbanQueue"`
 	OpTimeoutMs      int    `json:"opTimeoutMs"`
 	FastFailWindowMs int    `json:"fastFailWindowMs"`
 	DialTimeoutMs    int    `json:"dialTimeoutMs"`
@@ -202,6 +219,8 @@ type LimitConfig struct {
 	WebSocketMaxLifetimeSec   int     `json:"webSocketMaxLifetimeSec"`   // WebSocket 最大连接生命周期 (秒)
 	IpsetConcurrency          int     `json:"ipsetConcurrency"`          // ipset 并发数
 	IpsetTimeoutSec           int     `json:"ipsetTimeoutSec"`           // ipset 命令超时 (秒)
+	IPSetHashSize             int     `json:"ipsetHashSize"`             // ipset hashsize
+	IPSetMaxElem              int     `json:"ipsetMaxElem"`              // ipset maxelem
 	MachineHealthCheckSec     int     `json:"machineHealthCheckSec"`     // 机器健康检查间隔 (秒)
 	MachineMaxCPUPercent      float64 `json:"machineMaxCPUPercent"`      // CPU 使用率阈值 (%)
 	MachineMaxLoadPerCPU      float64 `json:"machineMaxLoadPerCpu"`      // 每核 Load 阈值
@@ -248,6 +267,22 @@ type adminBanTask struct {
 	unban    bool
 }
 
+type adminFallbackIPSetTask struct {
+	ip       string
+	duration time.Duration
+	unban    bool
+}
+
+type redisAdminBanQueueMessage struct {
+	IP       string `json:"ip"`
+	Duration int    `json:"duration"`
+	Reason   string `json:"reason"`
+}
+
+type redisAdminUnbanQueueMessage struct {
+	IP string `json:"ip"`
+}
+
 type tokenBucket struct {
 	tokens     float64
 	lastRefill time.Time
@@ -279,6 +314,8 @@ func defaultConfig() Config {
 			Addr:             "127.0.0.1:6379",
 			DB:               14,
 			Password:         "",
+			AdminBanQueue:    "",
+			AdminUnbanQueue:  "",
 			OpTimeoutMs:      defaultRedisOpTimeoutMs,
 			FastFailWindowMs: defaultRedisFastFailWindowMs,
 			DialTimeoutMs:    defaultRedisDialTimeoutMs,
@@ -322,6 +359,8 @@ func defaultConfig() Config {
 			WebSocketMaxLifetimeSec:   7200,
 			IpsetConcurrency:          10,
 			IpsetTimeoutSec:           5,
+			IPSetHashSize:             defaultIPSetHashSize,
+			IPSetMaxElem:              defaultIPSetMaxElem,
 			MachineHealthCheckSec:     2,
 			MachineMaxCPUPercent:      92,
 			MachineMaxLoadPerCPU:      1.5,
@@ -385,6 +424,8 @@ func normalizeConfig(c *Config) {
 	if strings.TrimSpace(c.Redis.Addr) == "" {
 		c.Redis.Addr = "127.0.0.1:6379"
 	}
+	c.Redis.AdminBanQueue = strings.TrimSpace(c.Redis.AdminBanQueue)
+	c.Redis.AdminUnbanQueue = strings.TrimSpace(c.Redis.AdminUnbanQueue)
 	if c.Redis.OpTimeoutMs <= 0 {
 		c.Redis.OpTimeoutMs = defaultRedisOpTimeoutMs
 	}
@@ -479,6 +520,12 @@ func normalizeConfig(c *Config) {
 	}
 	if c.Limits.IpsetTimeoutSec <= 0 {
 		c.Limits.IpsetTimeoutSec = 5
+	}
+	if c.Limits.IPSetHashSize <= 0 {
+		c.Limits.IPSetHashSize = defaultIPSetHashSize
+	}
+	if c.Limits.IPSetMaxElem <= 0 {
+		c.Limits.IPSetMaxElem = defaultIPSetMaxElem
 	}
 	if c.Limits.MachineHealthCheckSec <= 0 {
 		c.Limits.MachineHealthCheckSec = 2
@@ -642,9 +689,13 @@ func isTrustedProxyIP(ip net.IP) bool {
 }
 
 func applyConfig(newCfg Config) error {
+	prevRedisCfg := cfg.Redis
 	normalizeConfig(&newCfg)
 	if newCfg.Backend == "" {
 		return fmt.Errorf("配置文件中 backend 不能为空")
+	}
+	if newCfg.Redis.AdminBanQueue != "" && newCfg.Redis.AdminBanQueue == newCfg.Redis.AdminUnbanQueue {
+		return fmt.Errorf("redis.adminBanQueue 与 redis.adminUnbanQueue 不能相同")
 	}
 
 	parsedTrustedProxyNets, err := buildTrustedProxyNets(newCfg.TrustedProxies)
@@ -692,6 +743,7 @@ func applyConfig(newCfg Config) error {
 	banSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
 	connSem = make(chan struct{}, cfg.Limits.MaxConnections)
 	resetLocalRateLimiter()
+	syncRedisAdminQueueSubscribers(prevRedisCfg, newCfg.Redis)
 
 	return nil
 }
@@ -717,6 +769,218 @@ func withRedisTimeout(parent context.Context) (context.Context, context.CancelFu
 		parent = context.Background()
 	}
 	return context.WithTimeout(parent, redisOpTimeoutDuration())
+}
+
+func startRedisAdminQueueSubscribers() {
+	if rdb == nil {
+		return
+	}
+
+	banQueue := strings.TrimSpace(cfg.Redis.AdminBanQueue)
+	unbanQueue := strings.TrimSpace(cfg.Redis.AdminUnbanQueue)
+	if banQueue == "" && unbanQueue == "" {
+		return
+	}
+
+	redisAdminQueueMu.Lock()
+	if redisAdminQueueStop != nil {
+		redisAdminQueueMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	redisAdminQueueStop = stop
+	redisAdminQueueWG.Add(1)
+	redisAdminQueueMu.Unlock()
+
+	go func(banQueueName, unbanQueueName string, stopCh <-chan struct{}) {
+		defer redisAdminQueueWG.Done()
+		runRedisAdminQueueSubscribeLoop(stopCh, banQueueName, unbanQueueName)
+	}(banQueue, unbanQueue, stop)
+
+	log.Printf("Redis admin 队列订阅已启动: ban=%q unban=%q", banQueue, unbanQueue)
+}
+
+func stopRedisAdminQueueSubscribers() {
+	redisAdminQueueMu.Lock()
+	stop := redisAdminQueueStop
+	if stop == nil {
+		redisAdminQueueMu.Unlock()
+		return
+	}
+	close(stop)
+	redisAdminQueueStop = nil
+	redisAdminQueueMu.Unlock()
+	redisAdminQueueWG.Wait()
+}
+
+func syncRedisAdminQueueSubscribers(prevCfg RedisConfig, nextCfg RedisConfig) {
+	prevBan := strings.TrimSpace(prevCfg.AdminBanQueue)
+	prevUnban := strings.TrimSpace(prevCfg.AdminUnbanQueue)
+	nextBan := strings.TrimSpace(nextCfg.AdminBanQueue)
+	nextUnban := strings.TrimSpace(nextCfg.AdminUnbanQueue)
+
+	if prevBan == nextBan && prevUnban == nextUnban {
+		return
+	}
+
+	stopRedisAdminQueueSubscribers()
+	startRedisAdminQueueSubscribers()
+}
+
+func runRedisAdminQueueSubscribeLoop(stop <-chan struct{}, banQueueName, unbanQueueName string) {
+	channels := make([]string, 0, 2)
+	if banQueueName != "" {
+		channels = append(channels, banQueueName)
+	}
+	if unbanQueueName != "" && unbanQueueName != banQueueName {
+		channels = append(channels, unbanQueueName)
+	}
+	if len(channels) == 0 {
+		return
+	}
+
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+
+		if rdb == nil {
+			if !waitRedisAdminQueueRetry(stop, time.Second) {
+				return
+			}
+			continue
+		}
+
+		pubsub := rdb.Subscribe(context.Background(), channels...)
+		if _, err := pubsub.Receive(context.Background()); err != nil {
+			_ = pubsub.Close()
+			logThrottled("redis_admin_queue_subscribe", 3*time.Second, "Redis admin 队列订阅失败，准备重试: %v", err)
+			if !waitRedisAdminQueueRetry(stop, time.Second) {
+				return
+			}
+			continue
+		}
+
+		messageCh := pubsub.Channel(redis.WithChannelSize(1024))
+		disconnected := false
+		for !disconnected {
+			select {
+			case <-stop:
+				_ = pubsub.Close()
+				return
+			case msg, ok := <-messageCh:
+				if !ok {
+					disconnected = true
+					break
+				}
+				handleRedisAdminQueueMessage(msg, banQueueName, unbanQueueName)
+			}
+		}
+
+		_ = pubsub.Close()
+		if !waitRedisAdminQueueRetry(stop, 200*time.Millisecond) {
+			return
+		}
+	}
+}
+
+func waitRedisAdminQueueRetry(stop <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func handleRedisAdminQueueMessage(msg *redis.Message, banQueueName, unbanQueueName string) {
+	if msg == nil {
+		return
+	}
+
+	switch msg.Channel {
+	case banQueueName:
+		task, err := parseRedisBanQueueTask(msg.Payload)
+		if err != nil {
+			logThrottled("redis_admin_queue_ban_parse", 2*time.Second, "Redis ban 队列消息解析失败: %v", err)
+			return
+		}
+		enqueueAdminBanTask(task)
+	case unbanQueueName:
+		task, err := parseRedisUnbanQueueTask(msg.Payload)
+		if err != nil {
+			logThrottled("redis_admin_queue_unban_parse", 2*time.Second, "Redis unban 队列消息解析失败: %v", err)
+			return
+		}
+		enqueueAdminBanTask(task)
+	}
+}
+
+func parseRedisBanQueueTask(payload string) (adminBanTask, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return adminBanTask{}, fmt.Errorf("empty ban payload")
+	}
+
+	ip := payload
+	duration := 10 * time.Minute
+	reason := "redis queue ban"
+
+	if strings.HasPrefix(payload, "{") {
+		var msg redisAdminBanQueueMessage
+		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+			return adminBanTask{}, fmt.Errorf("invalid ban json payload: %w", err)
+		}
+		ip = strings.TrimSpace(msg.IP)
+		if msg.Duration > 0 {
+			duration = time.Duration(msg.Duration) * time.Second
+		}
+		if strings.TrimSpace(msg.Reason) != "" {
+			reason = strings.TrimSpace(msg.Reason)
+		}
+	}
+
+	parsedIP := net.ParseIP(strings.TrimSpace(ip))
+	if parsedIP == nil {
+		return adminBanTask{}, fmt.Errorf("invalid ban ip: %q", ip)
+	}
+
+	return adminBanTask{ip: parsedIP.String(), duration: duration, reason: reason, unban: false}, nil
+}
+
+func parseRedisUnbanQueueTask(payload string) (adminBanTask, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return adminBanTask{}, fmt.Errorf("empty unban payload")
+	}
+
+	ip := payload
+	if strings.HasPrefix(payload, "{") {
+		var msg redisAdminUnbanQueueMessage
+		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+			return adminBanTask{}, fmt.Errorf("invalid unban json payload: %w", err)
+		}
+		ip = strings.TrimSpace(msg.IP)
+	}
+
+	parsedIP := net.ParseIP(strings.TrimSpace(ip))
+	if parsedIP == nil {
+		return adminBanTask{}, fmt.Errorf("invalid unban ip: %q", ip)
+	}
+
+	return adminBanTask{ip: parsedIP.String(), duration: 0, reason: "redis queue unban", unban: true}, nil
 }
 
 func isRedisFastFailActive(now time.Time) bool {
@@ -1365,8 +1629,12 @@ func startAdminBanWorkers() {
 		workerCount = 1
 	}
 
-	adminBanQueue = make(chan adminBanTask, workerCount*256)
+	adminBanQueue = make(chan adminBanTask, workerCount*1024)
 	adminBanStop = make(chan struct{})
+	adminBanOverflowQueue = make(chan adminBanTask, workerCount*2048)
+	adminBanOverflowStop = make(chan struct{})
+	adminFallbackIPSetQueue = make(chan adminFallbackIPSetTask, workerCount*2048)
+	adminFallbackIPSetStop = make(chan struct{})
 
 	for i := 0; i < workerCount; i++ {
 		adminBanWG.Add(1)
@@ -1382,11 +1650,47 @@ func startAdminBanWorkers() {
 			}
 		}()
 	}
+
+	overflowWorkerCount := workerCount / 2
+	if overflowWorkerCount <= 0 {
+		overflowWorkerCount = 1
+	}
+	for i := 0; i < overflowWorkerCount; i++ {
+		adminBanOverflowWG.Add(1)
+		go func() {
+			defer adminBanOverflowWG.Done()
+			processAdminBanOverflowLoop()
+		}()
+	}
+
+	fallbackIPSetWorkerCount := workerCount / 2
+	if fallbackIPSetWorkerCount <= 0 {
+		fallbackIPSetWorkerCount = 1
+	}
+	for i := 0; i < fallbackIPSetWorkerCount; i++ {
+		adminFallbackIPSetWG.Add(1)
+		go func() {
+			defer adminFallbackIPSetWG.Done()
+			processAdminFallbackIPSetLoop()
+		}()
+	}
 }
 
 func stopAdminBanWorkers() {
 	if adminBanStop == nil {
 		return
+	}
+	if adminFallbackIPSetStop != nil {
+		close(adminFallbackIPSetStop)
+		adminFallbackIPSetWG.Wait()
+		adminFallbackIPSetStop = nil
+		adminFallbackIPSetQueue = nil
+	}
+	if adminBanOverflowStop != nil {
+		close(adminBanOverflowStop)
+		adminBanOverflowWG.Wait()
+		adminBanOverflowStop = nil
+		adminBanOverflowQueue = nil
 	}
 	close(adminBanStop)
 	adminBanWG.Wait()
@@ -1404,8 +1708,196 @@ func enqueueAdminBanTask(task adminBanTask) bool {
 	case adminBanQueue <- task:
 		return true
 	default:
+		applyAdminTaskLocalFallback(task)
+		if !enqueueAdminBanOverflowTask(task) {
+			adminBanOverflowDirectTotal.Add(1)
+			go runAdminBanTaskWithLimiter(task)
+			logThrottled("admin_queue_overflow_direct", 2*time.Second, "admin 溢出队列拥堵，已本地兜底并直接异步执行: ip=%s overflow_in=%d direct_exec=%d", task.ip, adminBanOverflowInTotal.Load(), adminBanOverflowDirectTotal.Load())
+			return true
+		}
+		logThrottled("admin_queue_overflow_async", 2*time.Second, "admin 队列拥堵，已本地兜底并异步重试入队: ip=%s overflow_in=%d direct_exec=%d", task.ip, adminBanOverflowInTotal.Load(), adminBanOverflowDirectTotal.Load())
+		return true
+	}
+}
+
+func enqueueAdminBanOverflowTask(task adminBanTask) bool {
+	queue := adminBanOverflowQueue
+	if queue == nil {
 		return false
 	}
+
+	select {
+	case queue <- task:
+		adminBanOverflowInTotal.Add(1)
+		return true
+	default:
+		return false
+	}
+}
+
+func processAdminBanOverflowLoop() {
+	const maxBatchSize = 128
+	const collectWindow = 3 * time.Millisecond
+
+	batch := make([]adminBanTask, 0, maxBatchSize)
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+
+	for {
+		select {
+		case <-adminBanOverflowStop:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case task := <-adminBanOverflowQueue:
+			batch = batch[:0]
+			batch = append(batch, task)
+
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(collectWindow)
+		collectLoop:
+			for len(batch) < maxBatchSize {
+				select {
+				case <-adminBanOverflowStop:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				case t := <-adminBanOverflowQueue:
+					batch = append(batch, t)
+				case <-timer.C:
+					break collectLoop
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+
+			retryEnqueueAdminBanBatch(batch)
+		}
+	}
+}
+
+func applyAdminTaskLocalFallback(task adminBanTask) {
+	if task.unban {
+		removeBlacklistLocal(task.ip)
+		enqueueAdminFallbackIPSetTask(adminFallbackIPSetTask{ip: task.ip, unban: true})
+		return
+	}
+
+	cacheBlacklistLocal(task.ip, task.duration)
+	enqueueAdminFallbackIPSetTask(adminFallbackIPSetTask{ip: task.ip, duration: task.duration})
+}
+
+func enqueueAdminFallbackIPSetTask(task adminFallbackIPSetTask) {
+	queue := adminFallbackIPSetQueue
+	if queue == nil {
+		runAdminFallbackIPSetTask(task)
+		return
+	}
+
+	select {
+	case queue <- task:
+		adminFallbackIPSetQueuedTotal.Add(1)
+	default:
+		adminFallbackIPSetDroppedTotal.Add(1)
+		logThrottled("admin_fallback_ipset_queue_drop", 2*time.Second, "admin fallback ipset 队列拥堵，跳过即时ipset同步: ip=%s queued=%d dropped=%d", task.ip, adminFallbackIPSetQueuedTotal.Load(), adminFallbackIPSetDroppedTotal.Load())
+	}
+}
+
+func processAdminFallbackIPSetLoop() {
+	for {
+		select {
+		case <-adminFallbackIPSetStop:
+			return
+		case task := <-adminFallbackIPSetQueue:
+			runAdminFallbackIPSetTask(task)
+		}
+	}
+}
+
+func runAdminFallbackIPSetTask(task adminFallbackIPSetTask) {
+	if task.unban {
+		syncIPSetUnban(task.ip)
+		return
+	}
+	enqueueIPSetBan(task.ip, task.duration)
+}
+
+func retryEnqueueAdminBanBatch(tasks []adminBanTask) {
+	const maxAttempts = 40
+	const retryInterval = 25 * time.Millisecond
+	if len(tasks) == 0 {
+		return
+	}
+
+	pending := tasks[:len(tasks)]
+
+	for i := 0; i < maxAttempts; i++ {
+		queue := adminBanQueue
+		if queue == nil {
+			adminBanOverflowDirectTotal.Add(uint64(len(pending)))
+			for _, task := range pending {
+				runAdminBanTaskWithLimiter(task)
+			}
+			return
+		}
+
+		writeIdx := 0
+		for _, task := range pending {
+			select {
+			case queue <- task:
+			default:
+				pending[writeIdx] = task
+				writeIdx++
+			}
+		}
+
+		if writeIdx == 0 {
+			return
+		}
+
+		pending = pending[:writeIdx]
+		time.Sleep(retryInterval)
+	}
+
+	adminBanOverflowDirectTotal.Add(uint64(len(pending)))
+	logThrottled("admin_queue_retry_exhausted", 2*time.Second, "admin 队列重试入队超时，剩余任务改为直接执行: count=%d overflow_in=%d direct_exec=%d", len(pending), adminBanOverflowInTotal.Load(), adminBanOverflowDirectTotal.Load())
+	for _, task := range pending {
+		runAdminBanTaskWithLimiter(task)
+	}
+}
+
+func runAdminBanTaskWithLimiter(task adminBanTask) {
+	sem := banSem
+	if sem == nil {
+		executeAdminBanTask(task)
+		return
+	}
+
+	sem <- struct{}{}
+	defer func() { <-sem }()
+	executeAdminBanTask(task)
 }
 
 func executeAdminBanTask(task adminBanTask) {
@@ -1811,10 +2303,7 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 	ipStr := parsedIP.String()
 	if req.Duration == 0 {
 		task := adminBanTask{ip: ipStr, duration: 0, reason: "manual unban", unban: true}
-		if !enqueueAdminBanTask(task) {
-			http.Error(w, "Admin queue busy", http.StatusServiceUnavailable)
-			return
-		}
+		enqueueAdminBanTask(task)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
@@ -1837,10 +2326,7 @@ func adminBanHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	task := adminBanTask{ip: ipStr, duration: duration, reason: reason, unban: false}
-	if !enqueueAdminBanTask(task) {
-		http.Error(w, "Admin queue busy", http.StatusServiceUnavailable)
-		return
-	}
+	enqueueAdminBanTask(task)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -2597,12 +3083,18 @@ func createIpsetBlacklist() error {
 	log.Println("创建 ipset blacklist 集合...")
 
 	// 创建集合
-	cmd := exec.Command("sudo", "ipset", "create", "blacklist", "hash:ip", "timeout", "600")
+	cmd := exec.Command(
+		"sudo", "ipset", "create", "blacklist", "hash:ip",
+		"family", "inet",
+		"timeout", "600",
+		"hashsize", strconv.Itoa(cfg.Limits.IPSetHashSize),
+		"maxelem", strconv.Itoa(cfg.Limits.IPSetMaxElem),
+	)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("创建 ipset 失败: %s", string(output))
 	}
 
-	log.Println("ipset blacklist 集合创建成功")
+	log.Printf("ipset blacklist 集合创建成功: hashsize=%d maxelem=%d", cfg.Limits.IPSetHashSize, cfg.Limits.IPSetMaxElem)
 	return nil
 }
 
@@ -2671,6 +3163,7 @@ func main() {
 	go startIPSetCleanup()
 	startIPSetWorkers()
 	startAdminBanWorkers()
+	startRedisAdminQueueSubscribers()
 	restoreLocalBanSnapshotFromFile()
 	startLocalBanPersistWorker()
 	startClusterMesh()
@@ -2705,6 +3198,7 @@ func main() {
 	stopLocalBanPersistWorker()
 	stopIPSetCleanup()
 	stopIPSetWorkers()
+	stopRedisAdminQueueSubscribers()
 	stopAdminBanWorkers()
 	stopClusterMesh()
 
