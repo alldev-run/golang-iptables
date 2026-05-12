@@ -59,42 +59,42 @@ var (
 	errNetlinkUnsupported = errors.New("ipset netlink unsupported")
 
 	// Redis
-	rdb *redis.Client
+	rdb                 *redis.Client
 	redisAdminQueueMu   sync.Mutex
 	redisAdminQueueStop chan struct{}
 	redisAdminQueueWG   sync.WaitGroup
 
 	// ipset 去重锁
-	ipsetMutex    sync.Mutex
-	ipsetCache    = make(map[string]time.Time)
-	ipsetQueue    chan ipsetBanTask
-	ipsetStop     chan struct{}
-	ipsetWG       sync.WaitGroup
-	adminBanQueue         chan adminBanTask
-	adminBanStop          chan struct{}
-	adminBanWG            sync.WaitGroup
-	adminBanOverflowQueue chan adminBanTask
-	adminBanOverflowStop  chan struct{}
-	adminBanOverflowWG    sync.WaitGroup
+	ipsetMutex              sync.Mutex
+	ipsetCache              = make(map[string]time.Time)
+	ipsetQueue              chan ipsetBanTask
+	ipsetStop               chan struct{}
+	ipsetWG                 sync.WaitGroup
+	adminBanQueue           chan adminBanTask
+	adminBanStop            chan struct{}
+	adminBanWG              sync.WaitGroup
+	adminBanOverflowQueue   chan adminBanTask
+	adminBanOverflowStop    chan struct{}
+	adminBanOverflowWG      sync.WaitGroup
 	adminFallbackIPSetQueue chan adminFallbackIPSetTask
 	adminFallbackIPSetStop  chan struct{}
 	adminFallbackIPSetWG    sync.WaitGroup
 
-	blacklistCacheMu    sync.RWMutex
-	blacklistHitCache   = make(map[string]time.Time)
-	blacklistMissCache  = make(map[string]time.Time)
-	localStrikeMu       sync.Mutex
-	localStrikeCache    = make(map[string]localStrikeState)
-	rateLimiter         localRateLimiter
-	rateLimiterConfig   rateLimiterConfigSnapshot
-	rateLimiterConfigMu sync.Mutex
-	logThrottleMu       sync.Mutex
-	logThrottleLastAt   = make(map[string]time.Time)
-	redisSyncCursorMu   sync.Mutex
-	redisSyncCursor     uint64
-	redisFastFailUntil  atomic.Int64
-	adminBanOverflowInTotal     atomic.Uint64
-	adminBanOverflowDirectTotal atomic.Uint64
+	blacklistCacheMu               sync.RWMutex
+	blacklistHitCache              = make(map[string]time.Time)
+	blacklistMissCache             = make(map[string]time.Time)
+	localStrikeMu                  sync.Mutex
+	localStrikeCache               = make(map[string]localStrikeState)
+	rateLimiter                    localRateLimiter
+	rateLimiterConfig              rateLimiterConfigSnapshot
+	rateLimiterConfigMu            sync.Mutex
+	logThrottleMu                  sync.Mutex
+	logThrottleLastAt              = make(map[string]time.Time)
+	redisSyncCursorMu              sync.Mutex
+	redisSyncCursor                uint64
+	redisFastFailUntil             atomic.Int64
+	adminBanOverflowInTotal        atomic.Uint64
+	adminBanOverflowDirectTotal    atomic.Uint64
 	adminFallbackIPSetQueuedTotal  atomic.Uint64
 	adminFallbackIPSetDroppedTotal atomic.Uint64
 
@@ -2507,33 +2507,41 @@ func readCPUSnapshot() (cpuSnapshot, error) {
 	if err != nil {
 		return cpuSnapshot{}, err
 	}
+
 	lineEnd := bytes.IndexByte(data, '\n')
 	if lineEnd < 0 {
 		lineEnd = len(data)
 	}
-	line := data[:lineEnd]
-	fields := bytes.Fields(line)
+
+	fields := bytes.Fields(data[:lineEnd])
+
 	if len(fields) < 5 || !bytes.Equal(fields[0], []byte("cpu")) {
 		return cpuSnapshot{}, fmt.Errorf("invalid /proc/stat format")
 	}
 
 	var total uint64
-	values := make([]uint64, 0, 10)
-	for _, field := range fields[1:] {
-		v, parseErr := parseUintASCII(field)
-		if parseErr != nil {
-			return cpuSnapshot{}, parseErr
+	var idle uint64
+
+	for i, field := range fields[1:] {
+		v, err := parseUintASCII(field)
+		if err != nil {
+			return cpuSnapshot{}, err
 		}
+
 		total += v
-		values = append(values, v)
+
+		switch i {
+		case 3:
+			idle = v
+		case 4:
+			idle += v
+		}
 	}
 
-	idle := values[3]
-	if len(values) > 4 {
-		idle += values[4]
-	}
-
-	return cpuSnapshot{total: total, idle: idle}, nil
+	return cpuSnapshot{
+		total: total,
+		idle:  idle,
+	}, nil
 }
 
 func cpuUsagePercent(prev cpuSnapshot, curr cpuSnapshot) (float64, bool) {

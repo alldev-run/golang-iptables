@@ -32,9 +32,9 @@
   },
   "rateLimit": {
     "maxRequests": 60,
-    "globalMaxRequests": 2500,
+    "globalMaxRequests": 5000,
     "windowSec": 10,
-    "maxConn": 2
+    "maxConn": 5
   },
   "auth": {
     "token": "CHANGE_ME_STRONG_TOKEN",
