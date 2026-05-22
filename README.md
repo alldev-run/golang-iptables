@@ -197,10 +197,10 @@ go mod download
 
 ```bash
 # 使用默认配置文件 config.json
-go run main.go 8080
+go run . 8080
 
 # 指定配置文件路径
-go run main.go 8080 /path/to/config.json
+go run . 8080 /path/to/config.json
 ```
 
 ## 测试
