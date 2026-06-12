@@ -70,7 +70,7 @@ var (
 
 	// ipset 去重锁
 	ipsetMutex              sync.Mutex
-	ipsetCache              = make(map[string]time.Time)
+	ipsetCache              = make(ipSetCacheMap)
 	ipsetQueue              chan ipsetBanTask
 	ipsetStop               chan struct{}
 	ipsetWG                 sync.WaitGroup
@@ -427,25 +427,42 @@ func upsertIPSetCacheWithCap(ip string, expireAt time.Time) bool {
 		return true
 	}
 
-	if len(ipsetCache) >= cfg.Limits.IpsetCacheMaxEntries {
-		now := time.Now()
-		for cachedIP, cachedExpireAt := range ipsetCache {
-			if now.After(cachedExpireAt) {
-				delete(ipsetCache, cachedIP)
-			}
-		}
-	}
+	// 随机采样清理过期项，避免 O(N) 全量遍历（原实现会在 20 万条时遍历整个 map）
+	ipsetCache.randomEvictExpired(100)
 
+	// 如果仍然满了，直接随机淘汰一个（Go map 遍历是伪随机的）
 	if len(ipsetCache) >= cfg.Limits.IpsetCacheMaxEntries {
 		for cachedIP := range ipsetCache {
 			delete(ipsetCache, cachedIP)
-			logThrottled("ipset_cache_evict", 5*time.Second, "ipsetCache 达到上限(%d)，触发淘汰保护", cfg.Limits.IpsetCacheMaxEntries)
+			logThrottled("ipset_cache_evict", 5*time.Second, "ipsetCache 达到上限(%d)，触发随机淘汰保护", cfg.Limits.IpsetCacheMaxEntries)
 			break
 		}
 	}
 
 	ipsetCache[ip] = expireAt
 	return true
+}
+
+// ipSetCacheMap 带过期功能的 IP 缓存类型
+type ipSetCacheMap map[string]time.Time
+
+// randomEvictExpired 随机采样检查过期项，sampleSize 为采样数量
+// 概率性清理避免大流量攻击时的 O(N) 遍历阻塞
+func (m ipSetCacheMap) randomEvictExpired(sampleSize int) {
+	if len(m) == 0 {
+		return
+	}
+	now := time.Now()
+	checked := 0
+	for ip, expireAt := range m {
+		if now.After(expireAt) {
+			delete(m, ip)
+		}
+		checked++
+		if checked >= sampleSize {
+			break
+		}
+	}
 }
 
 func normalizeConfig(c *Config) {
