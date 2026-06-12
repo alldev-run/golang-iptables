@@ -28,7 +28,8 @@
     "publishQueueSize": 1024,
     "publishBatchSize": 32,
     "publishFlushMs": 100,
-    "publishMaxPerSec": 500
+    "publishMaxPerSec": 500,
+    "batchPayloadMaxSize": 1200
   },
   "rateLimit": {
     "maxRequests": 20,

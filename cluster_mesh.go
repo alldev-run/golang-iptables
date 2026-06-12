@@ -19,18 +19,19 @@ import (
 )
 
 type ClusterConfig struct {
-	Enable           bool     `json:"enable"`
-	BindAddr         string   `json:"bindAddr"`
-	BindPort         int      `json:"bindPort"`
-	Join             []string `json:"join"`
-	SourceAllowCIDRs []string `json:"sourceAllowCidrs"`
-	Secret           string   `json:"secret"`
-	RetransmitMult   int      `json:"retransmitMult"`
-	NodeName         string   `json:"nodeName"`
-	PublishQueueSize int      `json:"publishQueueSize"`
-	PublishBatchSize int      `json:"publishBatchSize"`
-	PublishFlushMs   int      `json:"publishFlushMs"`
-	PublishMaxPerSec int      `json:"publishMaxPerSec"`
+	Enable              bool     `json:"enable"`
+	BindAddr            string   `json:"bindAddr"`
+	BindPort            int      `json:"bindPort"`
+	Join                []string `json:"join"`
+	SourceAllowCIDRs    []string `json:"sourceAllowCidrs"`
+	Secret              string   `json:"secret"`
+	RetransmitMult      int      `json:"retransmitMult"`
+	NodeName            string   `json:"nodeName"`
+	PublishQueueSize    int      `json:"publishQueueSize"`
+	PublishBatchSize    int      `json:"publishBatchSize"`
+	PublishFlushMs      int      `json:"publishFlushMs"`
+	PublishMaxPerSec    int      `json:"publishMaxPerSec"`
+	BatchPayloadMaxSize int      `json:"batchPayloadMaxSize"` // batch 最大字节数，0 使用默认值 1200
 }
 
 func buildClusterBatchPayload(pending [][]byte, limit int) ([]byte, int, error) {
@@ -51,7 +52,7 @@ func buildClusterBatchPayload(pending [][]byte, limit int) ([]byte, int, error) 
 		if err != nil {
 			return nil, 0, err
 		}
-		if len(candidate) > clusterBatchPayloadMaxBytes {
+		if len(candidate) > getClusterBatchPayloadMaxBytes() {
 			break
 		}
 		payload = candidate
@@ -80,7 +81,22 @@ type clusterBatchBanEvent struct {
 	Msgs []json.RawMessage `json:"msgs"`
 }
 
-const clusterBatchPayloadMaxBytes = 1200
+const defaultClusterBatchPayloadMaxBytes = 1200
+
+// getClusterBatchPayloadMaxBytes 获取 batch 最大字节数，可根据网络 MTU 或配置调整
+// 建议: Ethernet MTU 1500 - IP Header 20 - UDP Header 8 = 1472，考虑 memberlist 开销预留约 1200
+func getClusterBatchPayloadMaxBytes() int {
+	maxSize := cfg.Cluster.BatchPayloadMaxSize
+	if maxSize <= 0 {
+		return defaultClusterBatchPayloadMaxBytes
+	}
+	// 防止配置过大导致 UDP 分片或超出 memberlist 限制
+	const maxAllowed = 8192
+	if maxSize > maxAllowed {
+		return maxAllowed
+	}
+	return maxSize
+}
 
 type clusterBroadcast struct {
 	msg    []byte
@@ -216,8 +232,14 @@ func (d *clusterDelegate) handleBanEvent(msg []byte) {
 		logThrottled("cluster_event_verify", 3*time.Second, "cluster 事件签名校验失败: source=%s ip=%s", evt.Source, evt.IP)
 		return
 	}
-	if !isClusterSourceAllowed(evt.SourceAddr) {
-		logThrottled("cluster_event_source", 3*time.Second, "cluster 事件来源不在白名单，丢弃: source=%s sourceAddr=%s ip=%s", evt.Source, evt.SourceAddr, evt.IP)
+	// 从 memberlist 获取发送节点的真实地址，而非信任事件自报的 SourceAddr
+	senderAddr := getClusterMemberAddr(evt.Source)
+	if senderAddr == "" {
+		logThrottled("cluster_event_sender", 3*time.Second, "cluster 事件发送节点不在成员列表，丢弃: source=%s ip=%s", evt.Source, evt.IP)
+		return
+	}
+	if !isClusterSourceAllowed(senderAddr) {
+		logThrottled("cluster_event_source", 3*time.Second, "cluster 事件来源不在白名单，丢弃: source=%s senderAddr=%s ip=%s", evt.Source, senderAddr, evt.IP)
 		return
 	}
 
@@ -258,6 +280,7 @@ var (
 	clusterPublishQueueCh  chan []byte
 	clusterWorkerWG        sync.WaitGroup
 	clusterRunning         atomic.Bool
+	clusterPublishDropCnt  atomic.Uint64 // cluster publish 队列满丢弃计数
 )
 
 func startClusterMesh() {
@@ -305,11 +328,17 @@ func startClusterMesh() {
 	clusterSecretMu.Lock()
 	clusterSecret = []byte(cfg.Cluster.Secret)
 	clusterSecretMu.Unlock()
+	if len(cfg.Cluster.Secret) == 0 {
+		log.Println("[WARN] cluster secret 未配置，生产环境建议强制配置以增强安全性")
+	}
 
 	allowNets, err := buildClusterSourceAllowNets(cfg.Cluster.SourceAllowCIDRs)
 	if err != nil {
 		log.Printf("cluster sourceAllowCidrs 配置无效，降级为不过滤: %v", err)
 		allowNets = nil
+	}
+	if len(cfg.Cluster.SourceAllowCIDRs) == 0 {
+		log.Println("[WARN] cluster sourceAllowCidrs 未配置，接受所有来源事件，生产环境建议限制内网网段")
 	}
 	clusterSourceAllowMu.Lock()
 	clusterSourceAllowNets = allowNets
@@ -323,6 +352,7 @@ func startClusterMesh() {
 
 	clusterStopCleanup = make(chan struct{})
 	clusterPublishQueueCh = make(chan []byte, cfg.Cluster.PublishQueueSize)
+	clusterPublishDropCnt.Store(0)
 
 	clusterWorkerWG.Add(1)
 	go func() {
@@ -351,7 +381,10 @@ func stopClusterMesh() {
 		clusterStopCleanup = nil
 	}
 	clusterWorkerWG.Wait()
-	clusterPublishQueueCh = nil
+	// 先关闭 channel 让 send 端能检测到（select 会感知到 closed channel），而非设为 nil 导致 panic
+	if clusterPublishQueueCh != nil {
+		close(clusterPublishQueueCh)
+	}
 
 	if listAny := clusterMemberList.Load(); listAny != nil {
 		if err := listAny.(*memberlist.Memberlist).Shutdown(); err != nil {
@@ -406,10 +439,24 @@ func publishBanEvent(ip string, banDuration time.Duration, level int) {
 		return
 	}
 
+	// 双重检查：防止 clusterRunning 检查后 channel 被关闭
+	if !clusterRunning.Load() {
+		return
+	}
+
+	// 捕获向已关闭 channel 发送导致的 panic（stopClusterMesh 关闭 channel 时的竞态窗口）
+	defer func() {
+		if r := recover(); r != nil {
+			dropped := clusterPublishDropCnt.Add(1)
+			logThrottled("cluster_publish_drop", 2*time.Second, "cluster 发布队列关闭，丢弃事件: ip=%s total_dropped=%d", ip, dropped)
+		}
+	}()
+
 	select {
 	case clusterPublishQueueCh <- payload:
 	default:
-		logThrottled("cluster_publish_drop", 2*time.Second, "cluster 发布队列拥堵，丢弃事件: ip=%s", ip)
+		dropped := clusterPublishDropCnt.Add(1)
+		logThrottled("cluster_publish_drop", 2*time.Second, "cluster 发布队列拥堵，丢弃事件: ip=%s total_dropped=%d", ip, dropped)
 	}
 }
 
@@ -432,6 +479,24 @@ func getClusterLocalAddr() string {
 		return ""
 	}
 	return node.Addr.String()
+}
+
+// getClusterMemberAddr 通过节点名称从 memberlist 获取实际地址，防止 SourceAddr 被伪造
+func getClusterMemberAddr(nodeName string) string {
+	listAny := clusterMemberList.Load()
+	if listAny == nil {
+		return ""
+	}
+	list := listAny.(*memberlist.Memberlist)
+	for _, member := range list.Members() {
+		if member.Name == nodeName {
+			if member.Addr != nil {
+				return member.Addr.String()
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func marshalClusterEvent(evt clusterBanEvent) ([]byte, bool) {
@@ -487,7 +552,7 @@ func signWithSecret(secret []byte, data []byte) string {
 }
 
 func clusterEventID(evt clusterBanEvent) string {
-	return fmt.Sprintf("%s-%d-%d", evt.IP, evt.DurationMS, evt.Timestamp/1e9)
+	return fmt.Sprintf("%s-%d-%d", evt.IP, evt.DurationMS, evt.Timestamp)
 }
 
 func rememberClusterEvent(id string) bool {
