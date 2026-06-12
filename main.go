@@ -50,6 +50,10 @@ const (
 	defaultLocalBanPersistFlushMs    = 3000
 	defaultLocalBanPersistMaxEntries = 50000
 	defaultLocalBanPersistFile       = "./data/local_bans.json"
+	defaultIpsetRestoreBatchSize   = 100  // 每批 100 条命令
+	defaultIpsetRestoreFlushMs   = 50   // 50ms 定时检查间隔
+	defaultIpsetRestoreMaxWaitMs   = 500 // 最大等待 500ms 必须入库
+	defaultIpsetRestoreMaxPending  = 10000 // 最大积压 10000 条
 )
 
 var (
@@ -79,6 +83,17 @@ var (
 	adminFallbackIPSetQueue chan adminFallbackIPSetTask
 	adminFallbackIPSetStop  chan struct{}
 	adminFallbackIPSetWG    sync.WaitGroup
+
+	// ipset restore 批量处理（避免高频 fork）
+	ipsetRestoreMu        sync.Mutex
+	ipsetRestoreBuffer    []ipsetRestoreCmd
+	ipsetRestoreFirstAt   time.Time // 缓冲区第一条命令时间，用于最大等待时间控制
+	ipsetRestoreTicker    *time.Ticker
+	ipsetRestoreStop      chan struct{}
+	ipsetRestoreWG        sync.WaitGroup
+	ipsetRestoreDropCnt   atomic.Uint64
+	ipsetRestorePending   atomic.Int32 // 正在执行的 restore goroutine 数量
+	ipsetRestoreSem       chan struct{} // 专门用于 restore 的并发限制（与 ipsetSem 分离）
 
 	blacklistCacheMu               sync.RWMutex
 	blacklistHitCache              = make(map[string]time.Time)
@@ -238,6 +253,10 @@ type LimitConfig struct {
 	LocalBanPersistMaxEntries int     `json:"localBanPersistMaxEntries"` // 本地短期封禁持久化最大条目
 	AuthTimeoutSec            int     `json:"authTimeoutSec"`            // 认证超时 (秒)
 	ShutdownTimeoutSec        int     `json:"shutdownTimeoutSec"`        // 优雅关闭超时 (秒)
+	IpsetRestoreBatchSize     int     `json:"ipsetRestoreBatchSize"`     // ipset restore 批量提交大小（默认 100）
+	IpsetRestoreFlushMs       int     `json:"ipsetRestoreFlushMs"`       // ipset restore 定时检查间隔（毫秒，默认 50）
+	IpsetRestoreMaxWaitMs     int     `json:"ipsetRestoreMaxWaitMs"`     // ipset restore 最大等待时间（毫秒，默认 500，即使不足 batch size 也必须入库）
+	IpsetRestoreMaxPending    int     `json:"ipsetRestoreMaxPending"`    // ipset restore 最大积压命令数（默认 10000）
 }
 
 type localBanPersistRecord struct {
@@ -271,6 +290,14 @@ type adminFallbackIPSetTask struct {
 	ip       string
 	duration time.Duration
 	unban    bool
+}
+
+// ipset restore 批量命令结构
+type ipsetRestoreCmd struct {
+	ipsetName string
+	ip        string
+	timeout   int    // 秒，0 表示删除
+	isAdd     bool   // true=add, false=del
 }
 
 type redisAdminBanQueueMessage struct {
@@ -379,6 +406,10 @@ func defaultConfig() Config {
 			LocalBanPersistMaxEntries: defaultLocalBanPersistMaxEntries,
 			AuthTimeoutSec:            3,
 			ShutdownTimeoutSec:        30,
+			IpsetRestoreBatchSize:     defaultIpsetRestoreBatchSize,
+			IpsetRestoreFlushMs:       defaultIpsetRestoreFlushMs,
+			IpsetRestoreMaxWaitMs:     defaultIpsetRestoreMaxWaitMs,
+			IpsetRestoreMaxPending:    defaultIpsetRestoreMaxPending,
 		},
 		EnableWebSocket: true,
 	}
@@ -580,6 +611,22 @@ func normalizeConfig(c *Config) {
 	if c.Limits.ShutdownTimeoutSec <= 0 {
 		c.Limits.ShutdownTimeoutSec = 30
 	}
+	if c.Limits.IpsetRestoreBatchSize <= 0 {
+		c.Limits.IpsetRestoreBatchSize = defaultIpsetRestoreBatchSize
+	}
+	if c.Limits.IpsetRestoreFlushMs <= 0 {
+		c.Limits.IpsetRestoreFlushMs = defaultIpsetRestoreFlushMs
+	}
+	if c.Limits.IpsetRestoreMaxWaitMs <= 0 {
+		c.Limits.IpsetRestoreMaxWaitMs = defaultIpsetRestoreMaxWaitMs
+	}
+	// 限制最大等待时间不超过 5000ms
+	if c.Limits.IpsetRestoreMaxWaitMs > 5000 {
+		c.Limits.IpsetRestoreMaxWaitMs = 5000
+	}
+	if c.Limits.IpsetRestoreMaxPending <= 0 {
+		c.Limits.IpsetRestoreMaxPending = defaultIpsetRestoreMaxPending
+	}
 
 	if c.Cluster.BindPort <= 0 {
 		c.Cluster.BindPort = 7946
@@ -743,8 +790,18 @@ func applyConfig(newCfg Config) error {
 	ipsetSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
 	banSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
 	connSem = make(chan struct{}, cfg.Limits.MaxConnections)
+	// restore 使用更保守的并发限制（默认 5），避免极端情况下内核锁竞争
+	restoreConcurrency := 5
+	if cfg.Limits.IpsetConcurrency < restoreConcurrency {
+		restoreConcurrency = cfg.Limits.IpsetConcurrency
+	}
+	ipsetRestoreSem = make(chan struct{}, restoreConcurrency)
 	resetLocalRateLimiter()
 	syncRedisAdminQueueSubscribers(prevRedisCfg, newCfg.Redis)
+
+	// 启动或重启 ipset restore 批量处理 worker
+	stopIpsetRestoreWorker()
+	startIpsetRestoreWorker()
 
 	return nil
 }
@@ -2002,27 +2059,190 @@ func runIPSetAdd(ip string, banSeconds int) {
 }
 
 func runIPSetAddByCommand(ip string, banSeconds int) error {
-	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
-	defer cmdCancel()
-
-	ipset := getIPSetName(ip)
-	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "add", ipset, ip, "timeout", fmt.Sprintf("%d", banSeconds))
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
-	}
+	// 使用批量 restore 模式，减少 fork 开销
+	enqueueIpsetRestore(getIPSetName(ip), ip, banSeconds, true)
 	return nil
 }
 
 func runIPSetDelByCommand(ip string) error {
-	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.IpsetTimeoutSec)*time.Second)
-	defer cmdCancel()
-
-	ipset := getIPSetName(ip)
-	cmd := exec.CommandContext(cmdCtx, "ipset", "-exist", "del", ipset, ip)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
-	}
+	// 使用批量 restore 模式，减少 fork 开销
+	enqueueIpsetRestore(getIPSetName(ip), ip, 0, false)
 	return nil
+}
+
+// enqueueIpsetRestore 将命令加入批量缓冲区
+func enqueueIpsetRestore(ipsetName, ip string, timeout int, isAdd bool) {
+	ipsetRestoreMu.Lock()
+	defer ipsetRestoreMu.Unlock()
+
+	// 检查是否超出最大积压限制
+	if len(ipsetRestoreBuffer) >= cfg.Limits.IpsetRestoreMaxPending {
+		dropped := ipsetRestoreDropCnt.Add(1)
+		logThrottled("ipset_restore_drop", 5*time.Second, "ipset restore 缓冲区已满，丢弃命令: ipset=%s ip=%s total_dropped=%d", ipsetName, ip, dropped)
+		return
+	}
+
+	// 记录首次写入时间（用于最大等待时间控制）
+	if len(ipsetRestoreBuffer) == 0 {
+		ipsetRestoreFirstAt = time.Now()
+	}
+
+	ipsetRestoreBuffer = append(ipsetRestoreBuffer, ipsetRestoreCmd{
+		ipsetName: ipsetName,
+		ip:        ip,
+		timeout:   timeout,
+		isAdd:     isAdd,
+	})
+
+	// 达到批次大小立即刷新
+	if len(ipsetRestoreBuffer) >= cfg.Limits.IpsetRestoreBatchSize {
+		flushIpsetRestoreBuffer()
+	}
+}
+
+// shouldFlushIpsetRestore 检查是否应该刷新（达到 batch size 或超过最大等待时间）
+func shouldFlushIpsetRestore() bool {
+	if len(ipsetRestoreBuffer) == 0 {
+		return false
+	}
+	// 达到批次大小立即刷新
+	if len(ipsetRestoreBuffer) >= cfg.Limits.IpsetRestoreBatchSize {
+		return true
+	}
+	// 超过最大等待时间必须刷新（即使不足 batch size）
+	if !ipsetRestoreFirstAt.IsZero() && time.Since(ipsetRestoreFirstAt) >= time.Duration(cfg.Limits.IpsetRestoreMaxWaitMs)*time.Millisecond {
+		return true
+	}
+	return false
+}
+
+// flushIpsetRestoreBuffer 批量执行 ipset restore
+// 使用信号量限制并发，独立 goroutine 执行避免阻塞 worker，硬超时防止内核锁卡死
+func flushIpsetRestoreBuffer() {
+	if len(ipsetRestoreBuffer) == 0 {
+		return
+	}
+
+	// 构建 restore 脚本
+	var script strings.Builder
+	for _, cmd := range ipsetRestoreBuffer {
+		if cmd.isAdd {
+			script.WriteString(fmt.Sprintf("add %s %s timeout %d\n", cmd.ipsetName, cmd.ip, cmd.timeout))
+		} else {
+			script.WriteString(fmt.Sprintf("del %s %s\n", cmd.ipsetName, cmd.ip))
+		}
+	}
+	scriptContent := script.String()
+
+	// 清空缓冲区并重置首次时间
+	ipsetRestoreBuffer = ipsetRestoreBuffer[:0]
+	ipsetRestoreFirstAt = time.Time{}
+
+	// 使用专门的 restore 信号量限制并发（与 ipsetSem 分离，避免互相影响）
+	select {
+	case ipsetRestoreSem <- struct{}{}:
+		// 获取信号量，在独立 goroutine 中执行避免阻塞 worker
+		ipsetRestorePending.Add(1)
+		go func(content string) {
+			defer func() {
+				<-ipsetRestoreSem // 释放信号量
+				ipsetRestorePending.Add(-1)
+			}()
+
+			// 使用更短的硬超时（1秒），防止内核锁卡死导致 Goroutine 泄露
+			// 注意：CommandContext 在极端情况下可能无法立即中断内核态操作
+			cmdCtx, cmdCancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cmdCancel()
+
+			cmd := exec.CommandContext(cmdCtx, "ipset", "-!", "restore")
+			cmd.Stdin = strings.NewReader(content)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				parseIpsetRestoreError(string(output))
+			}
+		}(scriptContent)
+	case <-time.After(500 * time.Millisecond):
+		// 获取信号量超时，丢弃本次批量（数据已在 ipsetCache，稍后同步会补偿）
+		pending := ipsetRestorePending.Load()
+		logThrottled("ipset_restore_sem_timeout", 5*time.Second, "ipset restore 信号量获取超时，跳过本次批量提交 (pending=%d)", pending)
+	}
+}
+
+// parseIpsetRestoreError 解析 ipset restore 错误输出，区分不同错误类型
+// - IP 已存在：正常情况，幂等可忽略
+// - 集合已满：防御系统失效，需高优先级告警
+// - 其他错误：记录日志
+func parseIpsetRestoreError(output string) {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return
+	}
+
+	// 检查是否是 "IP 已存在" 错误（幂等，可忽略）
+	if strings.Contains(output, "Element already added to set") ||
+		strings.Contains(output, "already in set") {
+		// 正常情况，无需日志（高频场景避免刷屏）
+		return
+	}
+
+	// 检查是否是 "集合已满" 错误（防御系统失效！）
+	if strings.Contains(output, "Hash is full") ||
+		strings.Contains(output, "No more space") ||
+		strings.Contains(output, "hash is full") ||
+		strings.Contains(output, "cannot add more elements") {
+		// 高优先级告警：防御系统已失效，新威胁无法加入黑名单
+		logThrottled("ipset_restore_hash_full", 10*time.Second, "[CRITICAL] ipset 集合已满，防御系统失效！请立即增大 limits.ipsetMaxElem 或手动清理黑名单。output=%s", output)
+		return
+	}
+
+	// 检查是否是 "IP 不存在" 错误（删除时幂等）
+	if strings.Contains(output, "Element not found in set") ||
+		strings.Contains(output, "not in set") {
+		// 正常情况，无需日志
+		return
+	}
+
+	// 其他错误
+	logThrottled("ipset_restore_error", 3*time.Second, "ipset restore 批量执行失败: output=%s", output)
+}
+
+// startIpsetRestoreWorker 启动定时刷新 worker
+func startIpsetRestoreWorker() {
+	if ipsetRestoreStop != nil {
+		return
+	}
+	ipsetRestoreStop = make(chan struct{})
+	ipsetRestoreTicker = time.NewTicker(time.Duration(cfg.Limits.IpsetRestoreFlushMs) * time.Millisecond)
+	ipsetRestoreWG.Add(1)
+	go func() {
+		defer ipsetRestoreWG.Done()
+		for {
+			select {
+			case <-ipsetRestoreTicker.C:
+				ipsetRestoreMu.Lock()
+				if shouldFlushIpsetRestore() {
+					flushIpsetRestoreBuffer()
+				}
+				ipsetRestoreMu.Unlock()
+			case <-ipsetRestoreStop:
+				ipsetRestoreTicker.Stop()
+				ipsetRestoreMu.Lock()
+				flushIpsetRestoreBuffer() // 停止前刷盘
+				ipsetRestoreMu.Unlock()
+				return
+			}
+		}
+	}()
+}
+
+// stopIpsetRestoreWorker 停止定时刷新 worker
+func stopIpsetRestoreWorker() {
+	if ipsetRestoreStop == nil {
+		return
+	}
+	close(ipsetRestoreStop)
+	ipsetRestoreWG.Wait()
+	ipsetRestoreStop = nil
 }
 
 func banIP(ctx context.Context, ip string) {
@@ -3094,6 +3314,7 @@ func createIpsetBlacklist() error {
 			"timeout", "600",
 			"hashsize", strconv.Itoa(cfg.Limits.IPSetHashSize),
 			"maxelem", strconv.Itoa(cfg.Limits.IPSetMaxElem),
+			"-exist", // 幂等：如果集合已存在则不报错
 		)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("创建 ipset blacklist4 失败: %s", string(output))
@@ -3113,6 +3334,7 @@ func createIpsetBlacklist() error {
 			"timeout", "600",
 			"hashsize", strconv.Itoa(cfg.Limits.IPSetHashSize),
 			"maxelem", strconv.Itoa(cfg.Limits.IPSetMaxElem),
+			"-exist", // 幂等：如果集合已存在则不报错
 		)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("创建 ipset blacklist6 失败: %s", string(output))
@@ -3256,6 +3478,7 @@ func main() {
 	stopRedisAdminQueueSubscribers()
 	stopAdminBanWorkers()
 	stopClusterMesh()
+	stopIpsetRestoreWorker()
 
 	// 优雅关闭，等待现有请求完成
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.ShutdownTimeoutSec)*time.Second)

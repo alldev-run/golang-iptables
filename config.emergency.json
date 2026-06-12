@@ -75,6 +75,10 @@
     "localBanPersistFlushMs": 3000,
     "localBanPersistMaxEntries": 50000,
     "authTimeoutSec": 3,
-    "shutdownTimeoutSec": 15
+    "shutdownTimeoutSec": 15,
+    "ipsetRestoreBatchSize": 100,
+    "ipsetRestoreFlushMs": 50,
+    "ipsetRestoreMaxWaitMs": 500,
+    "ipsetRestoreMaxPending": 10000
   }
 }

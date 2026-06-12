@@ -63,7 +63,8 @@ go mod download
     "publishQueueSize": 1024,
     "publishBatchSize": 32,
     "publishFlushMs": 100,
-    "publishMaxPerSec": 500
+    "publishMaxPerSec": 500,
+    "batchPayloadMaxSize": 1200
   },
   "rateLimit": {
     "maxRequests": 100,
@@ -109,7 +110,11 @@ go mod download
     "localBanPersistFlushMs": 3000,
     "localBanPersistMaxEntries": 50000,
     "authTimeoutSec": 3,
-    "shutdownTimeoutSec": 15
+    "shutdownTimeoutSec": 15,
+    "ipsetRestoreBatchSize": 100,
+    "ipsetRestoreFlushMs": 50,
+    "ipsetRestoreMaxWaitMs": 500,
+    "ipsetRestoreMaxPending": 10000
   }
 }
 ```
@@ -143,6 +148,7 @@ go mod download
 - `cluster.publishBatchSize`：单次批量发送上限（默认 `32`）
 - `cluster.publishFlushMs`：批处理刷盘周期毫秒（默认 `100`）
 - `cluster.publishMaxPerSec`：每秒广播上限（默认 `500`）
+- `cluster.batchPayloadMaxSize`：Gossip 批量事件 payload 最大字节（默认 `1200`，可根据 MTU 调整，最大 `8192`）
 - `rateLimit.maxRequests`：限流窗口内最大请求数（默认 100）
 - `rateLimit.globalMaxRequests`：全局限流窗口内最大请求数（默认 5000）
 - `rateLimit.windowSec`：限流窗口时间（秒，默认 10）
@@ -164,6 +170,10 @@ go mod download
 - `limits.ipsetCacheMaxEntries`：ipset 本地缓存最大条目数（默认 200000，用于控制内存上限）
 - `limits.ipsetSyncMaxPerRound`：每轮 Redis→ipset 最大同步条目数（默认 50000，防止单轮同步过载）
 - `limits.blacklistIpKeyMaxLen`：blacklist key 中 IP 最大长度（默认 64，过滤异常 key）
+- `limits.ipsetRestoreBatchSize`：ipset restore 批量提交大小（默认 100，达到此数量立即批量入库）
+- `limits.ipsetRestoreFlushMs`：ipset restore 检查间隔（毫秒，默认 50，定时检查是否满足 flush 条件）
+- `limits.ipsetRestoreMaxWaitMs`：ipset restore 最大等待时间（毫秒，默认 500，即使不足 batch size 也必须入库）
+- `limits.ipsetRestoreMaxPending`：ipset restore 缓冲区最大积压命令数（默认 10000，超过则丢弃）
 - `limits.localBanPersistEnabled`：是否启用本地短期封禁持久化（默认 true）
 - `limits.localBanPersistFile`：本地短期封禁快照文件路径（默认 `./data/local_bans.json`）
 - `limits.localBanPersistWindowSec`：本地短期封禁持久化窗口（秒，默认 1800，范围 600~3600）
