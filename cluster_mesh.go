@@ -59,7 +59,7 @@ func buildClusterBatchPayload(pending [][]byte, limit int) ([]byte, int, error) 
 		used = i + 1
 	}
 
-	if used < 2 {
+	if used == 0 {
 		return nil, 0, nil
 	}
 
@@ -165,7 +165,7 @@ func runClusterPublishWorker(stop <-chan struct{}) {
 		if err != nil {
 			logThrottled("cluster_batch_marshal", 3*time.Second, "cluster 批量事件序列化失败，回退单条发送: %v", err)
 		}
-		if batchedCount > 1 && len(batchPayload) > 0 {
+		if batchedCount >= 1 && len(batchPayload) > 0 {
 			queue.QueueBroadcast(&clusterBroadcast{msg: batchPayload})
 			pending = pending[batchedCount:]
 			return

@@ -108,5 +108,6 @@ func isIPSetExistError(err error) bool {
 	return strings.Contains(msg, "already added") ||
 		strings.Contains(msg, "already in set") ||
 		msg == "exist" ||
-		strings.Contains(msg, "exist")
+		strings.Contains(msg, "element already exists") ||
+		strings.Contains(msg, "already exists")
 }

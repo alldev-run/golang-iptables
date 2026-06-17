@@ -50,10 +50,10 @@ const (
 	defaultLocalBanPersistFlushMs    = 3000
 	defaultLocalBanPersistMaxEntries = 50000
 	defaultLocalBanPersistFile       = "./data/local_bans.json"
-	defaultIpsetRestoreBatchSize   = 100  // 每批 100 条命令
-	defaultIpsetRestoreFlushMs   = 50   // 50ms 定时检查间隔
-	defaultIpsetRestoreMaxWaitMs   = 500 // 最大等待 500ms 必须入库
-	defaultIpsetRestoreMaxPending  = 10000 // 最大积压 10000 条
+	defaultIpsetRestoreBatchSize     = 100   // 每批 100 条命令
+	defaultIpsetRestoreFlushMs       = 50    // 50ms 定时检查间隔
+	defaultIpsetRestoreMaxWaitMs     = 500   // 最大等待 500ms 必须入库
+	defaultIpsetRestoreMaxPending    = 10000 // 最大积压 10000 条
 )
 
 var (
@@ -85,15 +85,15 @@ var (
 	adminFallbackIPSetWG    sync.WaitGroup
 
 	// ipset restore 批量处理（避免高频 fork）
-	ipsetRestoreMu        sync.Mutex
-	ipsetRestoreBuffer    []ipsetRestoreCmd
-	ipsetRestoreFirstAt   time.Time // 缓冲区第一条命令时间，用于最大等待时间控制
-	ipsetRestoreTicker    *time.Ticker
-	ipsetRestoreStop      chan struct{}
-	ipsetRestoreWG        sync.WaitGroup
-	ipsetRestoreDropCnt   atomic.Uint64
-	ipsetRestorePending   atomic.Int32 // 正在执行的 restore goroutine 数量
-	ipsetRestoreSem       chan struct{} // 专门用于 restore 的并发限制（与 ipsetSem 分离）
+	ipsetRestoreMu      sync.Mutex
+	ipsetRestoreBuffer  []ipsetRestoreCmd
+	ipsetRestoreFirstAt time.Time // 缓冲区第一条命令时间，用于最大等待时间控制
+	ipsetRestoreTicker  *time.Ticker
+	ipsetRestoreStop    chan struct{}
+	ipsetRestoreWG      sync.WaitGroup
+	ipsetRestoreDropCnt atomic.Uint64
+	ipsetRestorePending atomic.Int32  // 正在执行的 restore goroutine 数量
+	ipsetRestoreSem     chan struct{} // 专门用于 restore 的并发限制（与 ipsetSem 分离）
 
 	blacklistCacheMu               sync.RWMutex
 	blacklistHitCache              = make(map[string]time.Time)
@@ -179,6 +179,9 @@ return 0
 
 	ipsetCleanupTicker *time.Ticker
 	ipsetCleanupDone   chan struct{}
+
+	ipsetSyncStop chan struct{}
+	ipsetSyncWG   sync.WaitGroup
 
 	localBanPersistMu    sync.Mutex
 	localBanPersistDirty atomic.Bool
@@ -296,8 +299,8 @@ type adminFallbackIPSetTask struct {
 type ipsetRestoreCmd struct {
 	ipsetName string
 	ip        string
-	timeout   int    // 秒，0 表示删除
-	isAdd     bool   // true=add, false=del
+	timeout   int  // 秒，0 表示删除
+	isAdd     bool // true=add, false=del
 }
 
 type redisAdminBanQueueMessage struct {
@@ -762,6 +765,9 @@ func applyConfig(newCfg Config) error {
 	if newCfg.Redis.AdminBanQueue != "" && newCfg.Redis.AdminBanQueue == newCfg.Redis.AdminUnbanQueue {
 		return fmt.Errorf("redis.adminBanQueue 与 redis.adminUnbanQueue 不能相同")
 	}
+	if newCfg.Auth.AdminToken == "" {
+		log.Println("[WARN] auth.adminToken 未配置，/admin/ban 接口将永远返回 401 Unauthorized")
+	}
 
 	parsedTrustedProxyNets, err := buildTrustedProxyNets(newCfg.TrustedProxies)
 	if err != nil {
@@ -804,15 +810,24 @@ func applyConfig(newCfg Config) error {
 	upgrader.ReadBufferSize = cfg.Limits.WebSocketBufferSize
 	upgrader.WriteBufferSize = cfg.Limits.WebSocketBufferSize
 
-	ipsetSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
-	banSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
-	connSem = make(chan struct{}, cfg.Limits.MaxConnections)
+	// 仅在容量变化时重建信号量，避免覆盖旧信号量导致持有令牌的 goroutine 泄漏
+	if ipsetSem == nil || cap(ipsetSem) != cfg.Limits.IpsetConcurrency {
+		ipsetSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
+	}
+	if banSem == nil || cap(banSem) != cfg.Limits.IpsetConcurrency {
+		banSem = make(chan struct{}, cfg.Limits.IpsetConcurrency)
+	}
+	if connSem == nil || cap(connSem) != cfg.Limits.MaxConnections {
+		connSem = make(chan struct{}, cfg.Limits.MaxConnections)
+	}
 	// restore 使用更保守的并发限制（默认 5），避免极端情况下内核锁竞争
 	restoreConcurrency := 5
 	if cfg.Limits.IpsetConcurrency < restoreConcurrency {
 		restoreConcurrency = cfg.Limits.IpsetConcurrency
 	}
-	ipsetRestoreSem = make(chan struct{}, restoreConcurrency)
+	if ipsetRestoreSem == nil || cap(ipsetRestoreSem) != restoreConcurrency {
+		ipsetRestoreSem = make(chan struct{}, restoreConcurrency)
+	}
 	resetLocalRateLimiter()
 	syncRedisAdminQueueSubscribers(prevRedisCfg, newCfg.Redis)
 
@@ -1142,10 +1157,20 @@ func watchConfig() {
 			}
 			// 监听写入和重命名事件
 			if (event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Rename == fsnotify.Rename || event.Op&fsnotify.Create == fsnotify.Create) && filepath.Base(event.Name) == filepath.Base(configFile) {
-				// 等待文件写入完成
-				time.Sleep(100 * time.Millisecond)
-				if err := loadConfig(); err != nil {
-					log.Println("热重载配置失败:", err)
+				// 重试+退避策略等待文件写入完成，避免固定 sleep 读到未完成写入
+				const maxRetries = 3
+				var loadErr error
+				delay := 100 * time.Millisecond
+				for i := 0; i < maxRetries; i++ {
+					time.Sleep(delay)
+					loadErr = loadConfig()
+					if loadErr == nil {
+						break
+					}
+					delay *= 2
+				}
+				if loadErr != nil {
+					log.Println("热重载配置失败:", loadErr)
 				} else {
 					log.Println("配置热重载成功")
 				}
@@ -1590,7 +1615,10 @@ func startIPSetSync() {
 		return
 	}
 
+	ipsetSyncStop = make(chan struct{})
+	ipsetSyncWG.Add(1)
 	go func() {
+		defer ipsetSyncWG.Done()
 		ticker := time.NewTicker(time.Duration(cfg.Limits.IpsetSyncIntervalSec) * time.Second)
 		defer ticker.Stop()
 
@@ -1600,9 +1628,20 @@ func startIPSetSync() {
 			case <-ticker.C:
 				log.Println("开始从 Redis 同步黑名单到 ipset")
 				syncIPSetFromRedis()
+			case <-ipsetSyncStop:
+				return
 			}
 		}
 	}()
+}
+
+func stopIPSetSync() {
+	if ipsetSyncStop == nil {
+		return
+	}
+	close(ipsetSyncStop)
+	ipsetSyncWG.Wait()
+	ipsetSyncStop = nil
 }
 
 func startIPSetCleanup() {
@@ -1926,7 +1965,7 @@ func retryEnqueueAdminBanBatch(tasks []adminBanTask) {
 		return
 	}
 
-	pending := tasks[:len(tasks)]
+	pending := tasks[:]
 
 	for i := 0; i < maxAttempts; i++ {
 		queue := adminBanQueue
@@ -2342,13 +2381,13 @@ func triggerBanAsync(ip string) {
 }
 
 // ---------------- 分布式连接数 ----------------
-func incConn(ctx context.Context, ip string) (bool, error) {
+func incConn(ctx context.Context, ip string) (bool, string, error) {
 	if rdb == nil {
-		return true, nil
+		return true, "", nil
 	}
 	now := time.Now()
 	if isRedisFastFailActive(now) {
-		return true, nil
+		return true, "", nil
 	}
 
 	// 使用时间窗口前缀防止单 key 热点
@@ -2360,7 +2399,7 @@ func incConn(ctx context.Context, ip string) (bool, error) {
 	if err != nil {
 		markRedisFastFail(now, "inc_conn", err)
 		logThrottled("redis_inc_conn", 3*time.Second, "Redis error in incConn: %v", err)
-		return true, nil
+		return true, "", nil
 	}
 	clearRedisFastFail()
 	expireCtx, expireCancel := withRedisTimeout(ctx)
@@ -2369,19 +2408,17 @@ func incConn(ctx context.Context, ip string) (bool, error) {
 		logThrottled("redis_inc_conn_expire", 3*time.Second, "Redis error in incConn expire: %v", err)
 	}
 	expireCancel()
-	return allowed <= int64(cfg.RateLimit.MaxConn), nil
+	return allowed <= int64(cfg.RateLimit.MaxConn), key, nil
 }
 
-func decConn(ctx context.Context, ip string) {
-	if rdb == nil {
+func decConn(ctx context.Context, key string) {
+	if rdb == nil || key == "" {
 		return
 	}
 	if isRedisFastFailActive(time.Now()) {
 		return
 	}
 
-	timeWindow := time.Now().Unix() / 60
-	key := "conn:" + ip + ":" + strconv.FormatInt(timeWindow, 10)
 	decCtx, decCancel := withRedisTimeout(ctx)
 	if err := rdb.Decr(decCtx, key).Err(); err != nil {
 		markRedisFastFail(time.Now(), "dec_conn", err)
@@ -3083,7 +3120,7 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Upgrade 前连接数限制
-	allowed, err := incConn(ctx, ip)
+	allowed, connKey, err := incConn(ctx, ip)
 	if err != nil {
 		log.Println("Redis error in incConn:", err)
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
@@ -3093,7 +3130,7 @@ func websocketProxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Too many connections", 429)
 		return
 	}
-	defer decConn(ctx, ip)
+	defer decConn(ctx, connKey)
 
 	// 升级
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -3490,6 +3527,7 @@ func main() {
 	log.Println("正在关闭服务器...")
 
 	stopLocalBanPersistWorker()
+	stopIPSetSync()
 	stopIPSetCleanup()
 	stopIPSetWorkers()
 	stopRedisAdminQueueSubscribers()
@@ -3662,9 +3700,14 @@ func enforceBlacklistHitCacheCapLocked(ip string) {
 	}
 
 	now := time.Now()
+	checked := 0
 	for cachedIP, expireAt := range blacklistHitCache {
 		if !expireAt.After(now) {
 			delete(blacklistHitCache, cachedIP)
+		}
+		checked++
+		if checked >= 100 {
+			break
 		}
 	}
 

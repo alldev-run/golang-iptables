@@ -209,18 +209,20 @@ func TestIncConn(t *testing.T) {
 	ip := "1.2.3.4"
 
 	// 测试连接数递增
+	var lastKey string
 	for i := 0; i < 5; i++ {
-		allowed, err := incConn(ctx, ip)
+		allowed, key, err := incConn(ctx, ip)
 		if err != nil {
 			t.Fatalf("incConn() error = %v", err)
 		}
 		if !allowed {
 			t.Errorf("第 %d 个连接应该被允许", i+1)
 		}
+		lastKey = key
 	}
 
 	// 第 6 个连接应该被拒绝
-	allowed, err := incConn(ctx, ip)
+	allowed, _, err := incConn(ctx, ip)
 	if err != nil {
 		t.Fatalf("incConn() error = %v", err)
 	}
@@ -229,7 +231,7 @@ func TestIncConn(t *testing.T) {
 	}
 
 	// 清理
-	decConn(ctx, ip)
+	decConn(ctx, lastKey)
 }
 
 // 测试滑动窗口限流
@@ -595,12 +597,12 @@ func TestRedisUnavailableDegradedMode(t *testing.T) {
 		t.Fatalf("Redis 不可用时应降级放行，allowed=%v reason=%q", allowed, reason)
 	}
 
-	connAllowed, err := incConn(ctx, ip)
+	connAllowed, connKey, err := incConn(ctx, ip)
 	if err != nil || !connAllowed {
 		t.Fatalf("Redis 不可用时连接计数应放行，allowed=%v err=%v", connAllowed, err)
 	}
 
-	decConn(ctx, ip)
+	decConn(ctx, connKey)
 	banIP(ctx, ip)
 }
 
